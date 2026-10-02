@@ -1,3 +1,6 @@
+import copy
+import hashlib
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -651,10 +654,177 @@ class ThresholdSafeTests(unittest.TestCase):
         claim = {"shares": [{"share_id": "prod-db-root.v1.alice", "value": "00" * 66}]}
         self.assert_code("not_found", self.service.get_secret, "missing")
         self.assert_code("not_found", self.service.audit, "missing")
+        self.assert_code("not_found", self.service.export_backup, "missing")
         self.assert_code("not_found", self.service.distribute_share, "missing", {"holder": "alice"}, "k1")
         self.assert_code("not_found", self.service.reconstruct, "missing", claim, "k2")
         self.assert_code("not_found", self.service.rotate, "missing", {}, "k3")
         self.assert_code("not_found", self.service.record_approval, "missing", {"approver": "alice"}, "k4")
+
+    # ------------------------------------------------------------------- backup
+    @staticmethod
+    def checksum_of(backup):
+        material = {key: backup[key] for key in
+                    ("backup_version", "generated_at", "secret", "shares", "approvals", "audit_events")}
+        encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def resign(self, backup):
+        backup["checksum"] = self.checksum_of(backup)
+        return backup
+
+    def export(self):
+        return self.service.export_backup("prod-db-root")
+
+    def test_backup_is_self_contained_and_never_contains_the_plaintext_secret(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        backup = self.export()
+        self.assertEqual(
+            {"backup_version", "generated_at", "secret", "shares", "approvals", "audit_events", "checksum"},
+            set(backup),
+        )
+        self.assertEqual("thresholdsafe-backup-v1", backup["backup_version"])
+        self.assertNotIn(SECRET, json.dumps(backup))
+        secret = backup["secret"]
+        self.assertEqual(
+            {"id", "name", "version", "threshold", "holders", "approvals_required", "secret_length",
+             "secret_digest", "status", "status_reason", "status_changed_at", "created_at", "updated_at"},
+            set(secret),
+        )
+        self.assertEqual("prod-db-root", secret["id"])
+        self.assertEqual(len(SECRET.encode("utf-8")), secret["secret_length"])
+        self.assertEqual(64, len(secret["secret_digest"]))
+        self.assertEqual(5, len(backup["shares"]))
+        self.assertEqual(2, len(backup["approvals"]))
+        self.assertEqual(6, len(backup["audit_events"]))
+        self.assertEqual(self.checksum_of(backup), backup["checksum"])
+
+    def test_backup_covers_every_version_and_distinguishes_share_states(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        backup = self.export()
+        self.assertEqual({1, 2}, {share["version"] for share in backup["shares"]})
+        for share in backup["shares"]:
+            self.assertEqual(
+                {"share_id", "holder", "version", "coordinate", "value", "commitment",
+                 "distributed_at", "invalidated_at"},
+                set(share),
+            )
+        rotated_out = next(s for s in backup["shares"] if s["version"] == 1 and s["holder"] == "alice")
+        self.assertIsNotNone(rotated_out["distributed_at"])
+        self.assertIsNotNone(rotated_out["invalidated_at"])
+        never_issued = next(s for s in backup["shares"] if s["version"] == 1 and s["holder"] == "dave")
+        self.assertIsNone(never_issued["distributed_at"])
+        self.assertIsNotNone(never_issued["invalidated_at"])
+        pending = next(s for s in backup["shares"] if s["version"] == 2 and s["holder"] == "alice")
+        self.assertIsNone(pending["distributed_at"])
+        self.assertIsNone(pending["invalidated_at"])
+
+    def test_frozen_secret_can_still_be_exported_and_verified(self):
+        self.create()
+        self.freeze()
+        backup = self.export()
+        self.assertEqual("frozen", backup["secret"]["status"])
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
+    def test_verify_accepts_a_fresh_backup_and_reports_counts(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        result = self.service.verify_backup({"backup": self.export()})
+        self.assertEqual(
+            {"valid": True, "secret_id": "prod-db-root", "version": 1,
+             "share_count": 5, "approval_count": 2, "event_count": 6},
+            result,
+        )
+
+    def test_verify_does_not_consult_or_change_service_state(self):
+        self.create()
+        self.approve(["alice", "bob"])
+        backup = self.export()
+        before = self.service.audit("prod-db-root")
+        other = ThresholdSafe(str(Path(self.directory.name) / "empty.db"))
+        result = other.verify_backup({"backup": backup})
+        self.assertTrue(result["valid"])
+        self.assertEqual(before, self.service.audit("prod-db-root"))
+        count = self.service.store.connection.execute("SELECT COUNT(*) AS n FROM idempotency").fetchone()["n"]
+        self.assertEqual(3, count)  # create-1 plus the two approval keys; verify stored nothing
+
+    def test_verify_body_must_contain_exactly_backup(self):
+        self.create()
+        backup = self.export()
+        self.assert_code("validation_error", self.service.verify_backup, {})
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": backup, "extra": 1})
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": [backup]})
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": None})
+
+    def test_verify_rejects_structural_errors_as_validation_error(self):
+        self.create()
+        backup = self.export()
+        missing = {key: value for key, value in backup.items() if key != "shares"}
+        extra = dict(backup, unexpected=1)
+        wrong_version = self.resign(dict(backup, backup_version="thresholdsafe-backup-v2"))
+        shares_not_list = dict(backup, shares={})
+        mistyped_share = dict(backup, shares=[dict(backup["shares"][0], coordinate="1")])
+        secret_short = dict(backup, secret={k: v for k, v in backup["secret"].items() if k != "name"})
+        event_extra = dict(backup, audit_events=[dict(backup["audit_events"][0], note="x")])
+        for case in (missing, extra, wrong_version, shares_not_list, mistyped_share, secret_short, event_extra):
+            self.assert_code("validation_error", self.service.verify_backup, {"backup": case})
+
+    def test_verify_rejects_a_checksum_mismatch(self):
+        self.create()
+        backup = self.export()
+        flipped = dict(backup, checksum=("0" if backup["checksum"][0] != "0" else "1") + backup["checksum"][1:])
+        self.assert_code("backup_integrity", self.service.verify_backup, {"backup": flipped})
+        renamed = dict(backup, secret=dict(backup["secret"], name="renamed"))
+        self.assert_code("backup_integrity", self.service.verify_backup, {"backup": renamed})
+
+    def test_verify_rechecks_every_internal_invariant(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        backup = self.export()
+
+        def tampered(mutate):
+            candidate = copy.deepcopy(backup)
+            mutate(candidate)
+            return self.resign(candidate)
+
+        cases = [
+            # share value no longer matches its recorded commitment
+            lambda b: b["shares"][0].update(value="00" * 66),
+            # share_id does not belong to the secret/version/holder triple
+            lambda b: b["shares"][0].update(share_id="other-root.v1.alice"),
+            # a share is dropped, so the version roster no longer matches
+            lambda b: b.update(shares=b["shares"][1:]),
+            # approver is not a registered holder of that version
+            lambda b: b["approvals"][0].update(approver="mallory"),
+            # audit events out of order
+            lambda b: b.update(audit_events=[b["audit_events"][1], b["audit_events"][0]] + b["audit_events"][2:]),
+            # audit payload no longer matches the chain hash
+            lambda b: b["audit_events"][0]["payload"].update(tampered=True),
+        ]
+        for mutate in cases:
+            self.assert_code("backup_integrity", self.service.verify_backup, {"backup": tampered(mutate)})
+
+    def test_verify_of_a_multi_version_backup(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        self.approve(["alice"], key_prefix="v2")
+        backup = self.export()
+        result = self.service.verify_backup({"backup": backup})
+        self.assertEqual((2, 10, 3), (result["version"], result["share_count"], result["approval_count"]))
+        # A gap in the version sequence is an integrity failure, not a partial accept.
+        broken = copy.deepcopy(backup)
+        broken["shares"] = [share for share in broken["shares"] if share["version"] != 1]
+        broken["approvals"] = [a for a in broken["approvals"] if a["version"] != 1]
+        self.resign(broken)
+        self.assert_code("backup_integrity", self.service.verify_backup, {"backup": broken})
 
 
 if __name__ == "__main__":

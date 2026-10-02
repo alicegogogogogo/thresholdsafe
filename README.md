@@ -34,6 +34,9 @@ The initial release supports a compact public contract:
   unfreezing leaves the current version, shares and approvals untouched;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
+- a secret can be exported as a self-contained JSON backup and verified
+  offline against an independent integrity check, without touching service
+  state;
 - the plaintext secret is never written to the database: only its SHA-256
   commitment and byte length are kept, to verify what reconstruction recovers.
 
@@ -317,7 +320,6 @@ a previous share now fails with `stale_share`:
 ```http
 GET /secrets/prod-db-root/audit
 ```
-
 Returns the ordered append-only event stream of one secret plus a verdict on
 its integrity:
 
@@ -338,6 +340,51 @@ failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 `stale_share`, `share_not_distributed`, `share_mismatch`,
 `integrity_failure`); malformed bodies are not audited. A custody write
 rejected because the secret is frozen is recorded as `operation_blocked`.
+
+### Export a backup
+
+```http
+GET /secrets/prod-db-root/backup
+```
+
+Returns HTTP 200 with a self-contained JSON snapshot of one secret: the
+current custody record (with `secret_length` and `secret_digest`, never the
+plaintext), every share of every version, every approval, and the complete
+audit stream. Unknown secrets return 404 `not_found`. The export is read-only,
+so a frozen secret exports exactly like an active one.
+
+The top level carries exactly `backup_version` (always
+`thresholdsafe-backup-v1`), `generated_at` (UTC timestamp), `secret`,
+`shares`, `approvals`, `audit_events` and `checksum`. Each share keeps its
+`share_id`, `holder`, `version`, `coordinate`, `value`, `commitment` and the
+`distributed_at` / `invalidated_at` timestamps, so pending, distributed and
+invalidated shares stay distinguishable — and because share values are
+present, a backup is sensitive material. `checksum` is the lowercase hex
+SHA-256 of the other six members re-encoded as canonical JSON (sorted keys,
+compact separators), so member order and whitespace in the document do not
+affect it.
+
+### Verify a backup
+
+```http
+POST /backups/verify
+Content-Type: application/json
+
+{"backup": { ...exported document... }}
+```
+
+Checks a backup without reading or modifying any service state; no
+`Idempotency-Key` is required and nothing is audited or stored. A backup is
+either accepted whole or rejected whole. Structural problems (missing, extra
+or mistyped fields, an unsupported `backup_version`) are 400
+`validation_error`; a structurally valid backup whose checksum, secret
+ownership, version continuity, share identifiers, share commitments, approver
+roster or audit chain does not hold together is 409 `backup_integrity`. A
+valid backup returns HTTP 200:
+
+```json
+{"valid":true,"secret_id":"prod-db-root","version":1,"share_count":5,"approval_count":2,"event_count":8}
+```
 
 ## Data model
 
@@ -389,6 +436,7 @@ Errors use this shape:
 | `share_already_distributed` | 409 | that holder already received the share for this version |
 | `duplicate_approval` | 409 | that approver already approved this version |
 | `integrity_failure` | 409 | the recovered value does not match the stored commitment |
+| `backup_integrity` | 409 | a structurally valid backup fails its checksum or internal consistency checks |
 | `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
 | `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
 | `internal_error` | 500 | unexpected server failure |

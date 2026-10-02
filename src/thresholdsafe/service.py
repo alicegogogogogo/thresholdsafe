@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 from . import shamir
 from .errors import (
+    BackupIntegrity,
     ConflictError,
     DuplicateApproval,
     InsufficientApprovals,
@@ -35,6 +36,22 @@ from .store import Store
 
 ZERO_HASH = "0" * 64
 
+BACKUP_VERSION = "thresholdsafe-backup-v1"
+
+# A backup document allows exactly these members at each level; anything
+# missing, extra or mistyped is a validation error, not an integrity failure.
+BACKUP_KEYS = {"backup_version", "generated_at", "secret", "shares", "approvals", "audit_events", "checksum"}
+BACKUP_CONTENT_KEYS = ("backup_version", "generated_at", "secret", "shares", "approvals", "audit_events")
+BACKUP_SECRET_KEYS = {
+    "id", "name", "version", "threshold", "holders", "approvals_required", "secret_length",
+    "secret_digest", "status", "status_reason", "status_changed_at", "created_at", "updated_at",
+}
+BACKUP_SHARE_KEYS = {
+    "share_id", "holder", "version", "coordinate", "value", "commitment", "distributed_at", "invalidated_at",
+}
+BACKUP_APPROVAL_KEYS = {"version", "approver", "created_at", "consumed_at"}
+BACKUP_EVENT_KEYS = {"sequence", "type", "payload", "occurred_at", "previous_hash", "hash"}
+
 # Rejected attempts that are custody decisions rather than malformed requests
 # are worth recording even though they changed nothing else.
 AUDITED_FAILURES = frozenset(
@@ -63,6 +80,37 @@ def _share_commitment(secret_id: str, version: int, holder: str, value: str) -> 
 
 def _event_hash(previous: str, sequence: int, event_type: str, encoded: str, occurred_at: str) -> str:
     return hashlib.sha256(f"{previous}|{sequence}|{event_type}|{encoded}|{occurred_at}".encode()).hexdigest()
+
+
+def _backup_checksum(backup: dict[str, Any]) -> str:
+    # Only the member order and whitespace of the submitted document may vary:
+    # the checksum is taken over the canonical re-encoding of the content.
+    material = {key: backup[key] for key in BACKUP_CONTENT_KEYS}
+    return hashlib.sha256(Store.encode(material).encode("utf-8")).hexdigest()
+
+
+def _exact_keys(value: Any, keys: set[str], description: str) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != keys:
+        raise ValidationError(f"{description} must contain exactly {', '.join(sorted(keys))}")
+    return value
+
+
+def _str_member(value: Any, field: str) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{field} must be a string")
+    return value
+
+
+def _int_member(value: Any, field: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValidationError(f"{field} must be an integer")
+    return value
+
+
+def _optional_str_member(value: Any, field: str) -> str | None:
+    if value is not None and not isinstance(value, str):
+        raise ValidationError(f"{field} must be a string or null")
+    return value
 
 
 class ThresholdSafe:
@@ -440,6 +488,225 @@ class ThresholdSafe:
             "head_hash": previous,
             "events": events,
         }
+
+    # ------------------------------------------------------------------ backup
+    def export_backup(self, secret_id: str) -> dict[str, Any]:
+        # Read-only: a frozen secret exports exactly like an active one, and
+        # the plaintext secret is never part of the document, only its
+        # commitment (digest) and byte length. Share values are included, so
+        # a backup is sensitive material and must be handled accordingly.
+        document = self._document(secret_id)
+        shares = [
+            {
+                "share_id": row["share_id"],
+                "holder": row["holder"],
+                "version": row["version"],
+                "coordinate": row["coordinate"],
+                "value": row["value"],
+                "commitment": row["commitment"],
+                "distributed_at": row["distributed_at"],
+                "invalidated_at": row["invalidated_at"],
+            }
+            for row in self.store.connection.execute(
+                "SELECT share_id, holder, version, coordinate, value, commitment, distributed_at, "
+                "invalidated_at FROM shares WHERE secret_id = ? ORDER BY version, coordinate",
+                (secret_id,),
+            ).fetchall()
+        ]
+        approvals = [
+            {
+                "version": row["version"],
+                "approver": row["approver"],
+                "created_at": row["created_at"],
+                "consumed_at": row["consumed_at"],
+            }
+            for row in self.store.connection.execute(
+                "SELECT version, approver, created_at, consumed_at FROM approvals "
+                "WHERE secret_id = ? ORDER BY version, approver",
+                (secret_id,),
+            ).fetchall()
+        ]
+        events = [
+            {
+                "sequence": row["sequence"],
+                "type": row["type"],
+                "payload": self.store.decode(row["payload"]),
+                "occurred_at": row["occurred_at"],
+                "previous_hash": row["previous_hash"],
+                "hash": row["hash"],
+            }
+            for row in self.store.connection.execute(
+                "SELECT sequence, type, payload, occurred_at, previous_hash, hash FROM audit_events "
+                "WHERE secret_id = ? ORDER BY sequence",
+                (secret_id,),
+            ).fetchall()
+        ]
+        backup = {
+            "backup_version": BACKUP_VERSION,
+            "generated_at": self.store.now(),
+            "secret": {
+                key: document[key]
+                for key in (
+                    "id", "name", "version", "threshold", "holders", "approvals_required",
+                    "secret_length", "secret_digest", "status", "status_reason",
+                    "status_changed_at", "created_at", "updated_at",
+                )
+            },
+            "shares": shares,
+            "approvals": approvals,
+            "audit_events": events,
+        }
+        backup["checksum"] = _backup_checksum(backup)
+        return backup
+
+    def verify_backup(self, raw: Any) -> dict[str, Any]:
+        # Pure function of the submitted backup: the service state is neither
+        # read nor modified, no idempotency key is required, and nothing is
+        # audited. A backup is either accepted whole or rejected whole.
+        if not isinstance(raw, dict) or set(raw) != {"backup"}:
+            raise ValidationError("verify body must contain exactly backup")
+        backup = _exact_keys(raw["backup"], BACKUP_KEYS, "backup")
+        if backup["backup_version"] != BACKUP_VERSION:
+            raise ValidationError(f"backup_version must be {BACKUP_VERSION}")
+        _str_member(backup["generated_at"], "generated_at")
+        _str_member(backup["checksum"], "checksum")
+        secret = self._backup_secret(backup["secret"])
+        shares = self._backup_shares(backup["shares"])
+        approvals = self._backup_approvals(backup["approvals"])
+        events = self._backup_events(backup["audit_events"])
+        self._check_backup_integrity(backup, secret, shares, approvals, events)
+        return {
+            "valid": True,
+            "secret_id": secret["id"],
+            "version": secret["version"],
+            "share_count": len(shares),
+            "approval_count": len(approvals),
+            "event_count": len(events),
+        }
+
+    @staticmethod
+    def _backup_secret(raw: Any) -> dict[str, Any]:
+        secret = _exact_keys(raw, BACKUP_SECRET_KEYS, "backup secret")
+        _str_member(secret["id"], "secret.id")
+        _str_member(secret["name"], "secret.name")
+        _int_member(secret["version"], "secret.version")
+        _int_member(secret["threshold"], "secret.threshold")
+        holders = secret["holders"]
+        if not isinstance(holders, list) or not all(isinstance(holder, str) for holder in holders):
+            raise ValidationError("secret.holders must be an array of strings")
+        _int_member(secret["approvals_required"], "secret.approvals_required")
+        _int_member(secret["secret_length"], "secret.secret_length")
+        _str_member(secret["secret_digest"], "secret.secret_digest")
+        _str_member(secret["status"], "secret.status")
+        _optional_str_member(secret["status_reason"], "secret.status_reason")
+        _str_member(secret["status_changed_at"], "secret.status_changed_at")
+        _str_member(secret["created_at"], "secret.created_at")
+        _str_member(secret["updated_at"], "secret.updated_at")
+        return secret
+
+    @staticmethod
+    def _backup_shares(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            raise ValidationError("shares must be an array")
+        shares = []
+        for entry in raw:
+            share = _exact_keys(entry, BACKUP_SHARE_KEYS, "backup share")
+            _str_member(share["share_id"], "share.share_id")
+            _str_member(share["holder"], "share.holder")
+            _int_member(share["version"], "share.version")
+            _int_member(share["coordinate"], "share.coordinate")
+            _str_member(share["value"], "share.value")
+            _str_member(share["commitment"], "share.commitment")
+            _optional_str_member(share["distributed_at"], "share.distributed_at")
+            _optional_str_member(share["invalidated_at"], "share.invalidated_at")
+            shares.append(share)
+        return shares
+
+    @staticmethod
+    def _backup_approvals(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            raise ValidationError("approvals must be an array")
+        approvals = []
+        for entry in raw:
+            approval = _exact_keys(entry, BACKUP_APPROVAL_KEYS, "backup approval")
+            _int_member(approval["version"], "approval.version")
+            _str_member(approval["approver"], "approval.approver")
+            _str_member(approval["created_at"], "approval.created_at")
+            _optional_str_member(approval["consumed_at"], "approval.consumed_at")
+            approvals.append(approval)
+        return approvals
+
+    @staticmethod
+    def _backup_events(raw: Any) -> list[dict[str, Any]]:
+        if not isinstance(raw, list):
+            raise ValidationError("audit_events must be an array")
+        events = []
+        for entry in raw:
+            event = _exact_keys(entry, BACKUP_EVENT_KEYS, "backup audit event")
+            _int_member(event["sequence"], "audit event.sequence")
+            _str_member(event["type"], "audit event.type")
+            if not isinstance(event["payload"], dict):
+                raise ValidationError("audit event.payload must be an object")
+            _str_member(event["occurred_at"], "audit event.occurred_at")
+            _str_member(event["previous_hash"], "audit event.previous_hash")
+            _str_member(event["hash"], "audit event.hash")
+            events.append(event)
+        return events
+
+    @staticmethod
+    def _check_backup_integrity(
+        backup: dict[str, Any],
+        secret: dict[str, Any],
+        shares: list[dict[str, Any]],
+        approvals: list[dict[str, Any]],
+        events: list[dict[str, Any]],
+    ) -> None:
+        if _backup_checksum(backup) != backup["checksum"]:
+            raise BackupIntegrity("checksum does not match the backup content")
+        secret_id = secret["id"]
+        version = secret["version"]
+        holders = secret["holders"]
+        if not shares:
+            raise BackupIntegrity("backup contains no shares")
+        if not events:
+            raise BackupIntegrity("backup contains no audit events")
+        if len(set(holders)) != len(holders):
+            raise BackupIntegrity("secret holders must not repeat the same holder")
+        versions = sorted({share["version"] for share in shares})
+        if versions != list(range(1, version + 1)):
+            raise BackupIntegrity("share versions are not continuous from 1 to the current version")
+        roster: dict[int, set[str]] = {}
+        seen_shares: set[tuple[int, str]] = set()
+        for share in shares:
+            share_version, holder = share["version"], share["holder"]
+            if (share_version, holder) in seen_shares:
+                raise BackupIntegrity(f"version {share_version} carries more than one share for {holder}")
+            seen_shares.add((share_version, holder))
+            if share["share_id"] != _share_id(secret_id, share_version, holder):
+                raise BackupIntegrity(f"share {share['share_id']} does not belong to secret {secret_id}")
+            if share["commitment"] != _share_commitment(secret_id, share_version, holder, share["value"]):
+                raise BackupIntegrity(f"share {share['share_id']} value does not match its commitment")
+            roster.setdefault(share_version, set()).add(holder)
+        if roster[version] != set(holders):
+            raise BackupIntegrity("current version shares do not match the secret holder roster")
+        seen_approvals: set[tuple[int, str]] = set()
+        for approval in approvals:
+            approval_version, approver = approval["version"], approval["approver"]
+            if approver not in roster.get(approval_version, set()):
+                raise BackupIntegrity(f"approver {approver} is not a holder of version {approval_version}")
+            if (approval_version, approver) in seen_approvals:
+                raise BackupIntegrity(f"approver {approver} approves version {approval_version} more than once")
+            seen_approvals.add((approval_version, approver))
+        previous = ZERO_HASH
+        for sequence, event in enumerate(events, start=1):
+            if event["sequence"] != sequence:
+                raise BackupIntegrity("audit events are not strictly sequential from 1")
+            encoded = Store.encode(event["payload"])
+            if event["previous_hash"] != previous or event["hash"] != _event_hash(
+                previous, sequence, event["type"], encoded, event["occurred_at"]
+            ):
+                raise BackupIntegrity(f"audit event {sequence} does not match the hash chain")
+            previous = event["hash"]
 
     # ------------------------------------------------------------------ helpers
     def _source(self, seed: int | None) -> RandomSource:

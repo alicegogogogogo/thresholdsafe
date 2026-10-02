@@ -50,6 +50,10 @@ class IntegrityFailure(ConflictError):
     code = "integrity_failure"
 
 
+class BackupIntegrity(ConflictError):
+    code = "backup_integrity"
+
+
 class SecretFrozen(ConflictError):
     code = "secret_frozen"
 
