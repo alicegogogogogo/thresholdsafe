@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .errors import ValidationError
+from .policy import parse as parse_policy
 from .shamir import MAX_SECRET_BYTES
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
@@ -120,13 +121,14 @@ class SecretSpec:
     approvals_required: int
     secret: bytes
     seed: int | None
+    policy: dict[str, Any] | None
 
     @classmethod
     def parse(cls, raw: Any) -> "SecretSpec":
         if not isinstance(raw, dict):
             raise ValidationError("secret definition must be an object")
         required = ["id", "name", "threshold", "holders", "approvals_required", "secret"]
-        no_unknown_fields(raw, set(required) | {"seed"}, "secret definition")
+        no_unknown_fields(raw, set(required) | {"seed", "policy"}, "secret definition")
         missing = sorted(set(required) - set(raw))
         if missing:
             raise ValidationError(f"missing required fields: {', '.join(missing)}")
@@ -142,7 +144,12 @@ class SecretSpec:
             approvals_required,
             secret_bytes(raw["secret"]),
             seed_value(raw["seed"]) if "seed" in raw else None,
+            parse_policy(raw["policy"]) if "policy" in raw else None,
         )
+
+
+#: Sentinel marking an omitted rotation policy: the current policy is kept.
+KEEP_POLICY = object()
 
 
 @dataclass(frozen=True)
@@ -154,13 +161,14 @@ class RotationSpec:
     holders: tuple[str, ...] | None
     approvals_required: int | None
     seed: int | None
+    policy: Any  # KEEP_POLICY when omitted, None to clear, else a validated expression
 
     @classmethod
     def parse(cls, raw: Any) -> "RotationSpec":
         if not isinstance(raw, dict):
             raise ValidationError("rotation body must be an object")
         no_unknown_fields(
-            raw, {"secret", "threshold", "holders", "approvals_required", "seed"}, "rotation body"
+            raw, {"secret", "threshold", "holders", "approvals_required", "seed", "policy"}, "rotation body"
         )
         return cls(
             secret_bytes(raw["secret"]) if "secret" in raw else None,
@@ -170,4 +178,5 @@ class RotationSpec:
             if "approvals_required" in raw
             else None,
             seed_value(raw["seed"]) if "seed" in raw else None,
+            parse_policy(raw["policy"]) if "policy" in raw else KEEP_POLICY,
         )

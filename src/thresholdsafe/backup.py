@@ -19,8 +19,10 @@ from typing import Any
 
 from .errors import BackupIntegrity, ValidationError
 from .model import identifier, positive_int
+from .policy import parse as parse_policy
 
-BACKUP_VERSION = "thresholdsafe-backup-v1"
+BACKUP_VERSION_V1 = "thresholdsafe-backup-v1"
+BACKUP_VERSION = "thresholdsafe-backup-v2"
 ZERO_HASH = "0" * 64
 HEX_HASH = re.compile(r"^[0-9a-f]{64}$")
 SHARE_VALUE = re.compile(r"^[0-9a-f]{1,132}$")
@@ -34,6 +36,7 @@ TOP_LEVEL_FIELDS = {
     "audit_events",
     "checksum",
 }
+TOP_LEVEL_FIELDS_V2 = TOP_LEVEL_FIELDS | {"authorization_policy"}
 SECRET_FIELDS = {
     "id",
     "name",
@@ -187,9 +190,22 @@ def _parse_event(raw: Any) -> dict[str, Any]:
 
 
 def _parse(backup: Any) -> dict[str, Any]:
-    document = _require_object(backup, TOP_LEVEL_FIELDS, "backup")
-    if document["backup_version"] != BACKUP_VERSION:
-        raise ValidationError(f"backup_version must be {BACKUP_VERSION}")
+    if not isinstance(backup, dict):
+        raise ValidationError("backup must be an object")
+    version = backup.get("backup_version")
+    if version == BACKUP_VERSION_V1:
+        fields = TOP_LEVEL_FIELDS
+    elif version == BACKUP_VERSION:
+        fields = TOP_LEVEL_FIELDS_V2
+    elif "backup_version" not in backup:
+        raise ValidationError("backup is missing required fields: backup_version")
+    else:
+        raise ValidationError(f"backup_version must be {BACKUP_VERSION_V1} or {BACKUP_VERSION}")
+    document = _require_object(backup, fields, "backup")
+    if version == BACKUP_VERSION:
+        # The policy is part of the v2 structure: a syntactically invalid
+        # expression makes the document malformed, not merely inconsistent.
+        parse_policy(document["authorization_policy"])
     _non_empty_text(document["generated_at"], "generated_at")
     _hash_text(document["checksum"], "checksum")
     shares = document["shares"]

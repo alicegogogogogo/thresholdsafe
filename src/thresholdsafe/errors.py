@@ -54,6 +54,15 @@ class BackupIntegrity(ConflictError):
     code = "backup_integrity"
 
 
+class PolicyDenied(ConflictError):
+    code = "policy_denied"
+
+    def __init__(self, message, payload=None):
+        super().__init__(message)
+        # Facts recorded as the authorization_denied audit event payload.
+        self.payload = payload if payload is not None else {}
+
+
 class SecretFrozen(ConflictError):
     code = "secret_frozen"
 
