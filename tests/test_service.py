@@ -388,6 +388,172 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assert_code("not_found", self.service.rotate, "missing", {}, "k3")
         self.assert_code("not_found", self.service.record_approval, "missing", {"approver": "alice"}, "k4")
 
+    # --------------------------------------------------------- freeze/unfreeze
+    def test_new_secret_is_active_with_a_null_reason(self):
+        record = self.create()
+        self.assertEqual("active", record["status"])
+        self.assertIsNone(record["status_reason"])
+        self.assertIn("status_changed_at", record)
+        self.assertEqual(record, self.service.get_secret("prod-db-root"))
+
+    def test_freeze_and_unfreeze_transitions(self):
+        self.create()
+        frozen = self.service.freeze("prod-db-root", {"reason": "  incident response  "}, "freeze-1")
+        self.assertEqual("frozen", frozen["status"])
+        self.assertEqual("incident response", frozen["status_reason"])
+        self.assertIn("status_changed_at", frozen)
+        self.assertEqual(frozen, self.service.get_secret("prod-db-root"))
+
+        active = self.service.unfreeze("prod-db-root", {"reason": "all clear"}, "unfreeze-1")
+        self.assertEqual("active", active["status"])
+        self.assertEqual("all clear", active["status_reason"])
+        self.assertNotEqual(frozen["status_changed_at"], active["status_changed_at"])
+        self.assertEqual(active, self.service.get_secret("prod-db-root"))
+
+    def test_redundant_transitions_are_conflicts(self):
+        self.create()
+        self.assert_code("secret_not_frozen", self.service.unfreeze, "prod-db-root", {"reason": "x"}, "unfreeze-1")
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+        self.assert_code("secret_frozen", self.service.freeze, "prod-db-root", {"reason": "again"}, "freeze-2")
+
+    def test_freeze_validation(self):
+        self.create()
+        freeze = self.service.freeze
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": "x"}, None)
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": "   "}, "k1")
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": ""}, "k2")
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": "x" * 201}, "k3")
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": 7}, "k4")
+        self.assert_code("validation_error", freeze, "prod-db-root", {"reason": "x", "ticket": "1"}, "k5")
+        self.assert_code("validation_error", freeze, "prod-db-root", {}, "k6")
+        self.assert_code("not_found", freeze, "missing", {"reason": "x"}, "k7")
+        self.assertEqual(
+            "active", self.service.get_secret("prod-db-root")["status"], "rejected freeze must not change status"
+        )
+
+    def test_frozen_secret_blocks_all_four_write_entry_points(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice"])
+        before = self.service.get_secret("prod-db-root")
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+
+        claim = {"shares": self.claims(issued, ["alice", "bob", "carol"])}
+        self.assert_code("secret_frozen", self.service.distribute_share, "prod-db-root", {"holder": "dave"}, "d1")
+        self.assert_code("secret_frozen", self.service.record_approval, "prod-db-root", {"approver": "bob"}, "a1")
+        self.assert_code("secret_frozen", self.service.reconstruct, "prod-db-root", claim, "r1")
+        self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, "rot1")
+
+        after = self.service.get_secret("prod-db-root")
+        self.assertEqual(before["version"], after["version"])
+        self.assertEqual(before["threshold"], after["threshold"])
+        self.assertEqual(before["holders"], after["holders"])
+        self.assertEqual(before["distributed_shares"], after["distributed_shares"])
+        self.assertEqual(before["approvals"], after["approvals"])
+        self.assertEqual(before["secret_length"], after["secret_length"])
+        self.assertEqual("frozen", after["status"])
+
+    def test_freeze_preserves_shares_approvals_and_commitment_across_unfreeze(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+        self.service.unfreeze("prod-db-root", {"reason": "clear"}, "unfreeze-1")
+        record = self.service.get_secret("prod-db-root")
+        self.assertEqual(3, record["distributed_shares"])
+        self.assertEqual((2, True), (record["approvals"]["recorded"], record["approvals"]["satisfied"]))
+        # existing distributed shares and unconsumed approvals keep working
+        result = self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_blocked_writes_append_operation_blocked_events(self):
+        self.create()
+        issued = self.distribute(["alice"])
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+
+        self.assert_code("secret_frozen", self.service.distribute_share, "prod-db-root", {"holder": "bob"}, "d1")
+        self.assert_code("secret_frozen", self.service.record_approval, "prod-db-root", {"approver": "alice"}, "a1")
+        self.assert_code(
+            "secret_frozen",
+            self.service.reconstruct,
+            "prod-db-root",
+            {"shares": self.claims(issued, ["alice"])},
+            "r1",
+        )
+        self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, "rot1")
+
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        blocked = [event for event in run["events"] if event["type"] == "operation_blocked"]
+        self.assertEqual(
+            ["distribute_share", "record_approval", "reconstruct", "rotate"],
+            [event["payload"]["operation"] for event in blocked],
+        )
+        self.assertTrue(all(event["payload"]["code"] == "secret_frozen" for event in blocked))
+        self.assertNotIn("secret_reconstructed", [event["type"] for event in run["events"]])
+        self.assertNotIn("secret_rotated", [event["type"] for event in run["events"]])
+
+    def test_each_rejected_request_appends_its_own_blocked_event(self):
+        self.create()
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+        for key in ("k1", "k2"):
+            self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, key)
+        run = self.service.audit("prod-db-root")
+        self.assertEqual(
+            2, len([event for event in run["events"] if event["type"] == "operation_blocked"])
+        )
+        self.assertTrue(run["chain_valid"])
+
+    def test_freeze_events_carry_version_and_reason_and_extend_the_chain(self):
+        self.create()
+        self.service.freeze("prod-db-root", {"reason": "incident"}, "freeze-1")
+        self.service.unfreeze("prod-db-root", {"reason": "clear"}, "unfreeze-1")
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        frozen, unfrozen = run["events"][-2:]
+        self.assertEqual("secret_frozen", frozen["type"])
+        self.assertEqual({"version": 1, "reason": "incident"}, frozen["payload"])
+        self.assertEqual("secret_unfrozen", unfrozen["type"])
+        self.assertEqual({"version": 1, "reason": "clear"}, unfrozen["payload"])
+        self.assertEqual(frozen["hash"], unfrozen["previous_hash"])
+        self.assertEqual(run["head_hash"], unfrozen["hash"])
+
+    def test_freeze_transition_is_replayed_but_other_operations_conflict(self):
+        self.create()
+        body = {"reason": "incident"}
+        first = self.service.freeze("prod-db-root", body, "freeze-key")
+        replayed = self.service.freeze("prod-db-root", body, "freeze-key")
+        self.assertEqual(first, replayed)
+        self.service.unfreeze("prod-db-root", {"reason": "clear"}, "unfreeze-1")
+        # the same key cannot drive a different operation
+        self.assert_code(
+            "conflict", self.service.unfreeze, "prod-db-root", {"reason": "clear"}, "freeze-key"
+        )
+        self.assert_code("conflict", self.service.rotate, "prod-db-root", {}, "freeze-key")
+        # the replay stored exactly one freeze event
+        run = self.service.audit("prod-db-root")
+        self.assertEqual(
+            1, len([event for event in run["events"] if event["type"] == "secret_frozen"])
+        )
+
+    def test_a_new_freeze_cycle_replays_the_old_freeze_response(self):
+        self.create()
+        first = self.service.freeze("prod-db-root", {"reason": "first"}, "freeze-key")
+        self.service.unfreeze("prod-db-root", {"reason": "clear"}, "unfreeze-1")
+        # same key, same transition kind -> the stored success is replayed and
+        # no new freeze happens
+        replayed = self.service.freeze("prod-db-root", {"reason": "second"}, "freeze-key")
+        self.assertEqual(first, replayed)
+        self.assertEqual("active", self.service.get_secret("prod-db-root")["status"])
+        run = self.service.audit("prod-db-root")
+        self.assertEqual(
+            1, len([event for event in run["events"] if event["type"] == "secret_frozen"])
+        )
+
+    def test_unknown_secret_freeze_and_unfreeze_are_not_found(self):
+        self.assert_code("not_found", self.service.freeze, "missing", {"reason": "x"}, "k1")
+        self.assert_code("not_found", self.service.unfreeze, "missing", {"reason": "x"}, "k2")
+
 
 if __name__ == "__main__":
     unittest.main()

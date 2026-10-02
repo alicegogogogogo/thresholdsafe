@@ -54,6 +54,8 @@ class Handler(BaseHTTPRequestHandler):
                     "approvals": (201, self.service.record_approval),
                     "reconstruct": (200, self.service.reconstruct),
                     "rotate": (200, self.service.rotate),
+                    "freeze": (200, self.service.freeze),
+                    "unfreeze": (200, self.service.unfreeze),
                 }
                 if parts[2] in actions:
                     status, action = actions[parts[2]]

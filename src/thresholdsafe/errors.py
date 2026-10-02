@@ -48,3 +48,11 @@ class DuplicateApproval(ConflictError):
 
 class IntegrityFailure(ConflictError):
     code = "integrity_failure"
+
+
+class SecretFrozen(ConflictError):
+    code = "secret_frozen"
+
+
+class SecretNotFrozen(ConflictError):
+    code = "secret_not_frozen"

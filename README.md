@@ -107,6 +107,41 @@ Returns the same custody record, so a client can see the current version, the
 roster, how many shares have been distributed, and whether the approval policy
 is currently satisfied. Unknown secrets return 404.
 
+The record also carries the lifecycle status: `status` is `active` or
+`frozen`, `status_reason` is the reason recorded by the last transition (or
+`null` before the secret has ever been frozen), and `status_changed_at` is the
+UTC timestamp of that transition.
+
+### Freeze and unfreeze a secret
+
+```http
+POST /secrets/prod-db-root/freeze
+Idempotency-Key: demo-freeze
+Content-Type: application/json
+
+{"reason": "suspected holder compromise"}
+```
+
+`POST /secrets/{id}/freeze` moves an active secret to `frozen`, and
+`POST /secrets/{id}/unfreeze` moves it back to `active`. The body must contain
+exactly `reason`, a string that is non-empty after trimming surrounding
+whitespace and at most 200 characters (the trimmed value is what is stored and
+audited). Both endpoints require an `Idempotency-Key`, return HTTP 200 with the
+custody record, and never change the current version, threshold, holders,
+shares, approval quota, secret length or commitment. After unfreezing,
+previously distributed shares and unconsumed approvals keep working under the
+current rules.
+
+While a secret is frozen the four write entry points — share distribution,
+approval recording, reconstruction and rotation — all fail with HTTP 409
+`secret_frozen` and leave shares, approvals, versions, the secret commitment
+and idempotency records untouched; each rejected attempt appends an
+`operation_blocked` audit event recording the `operation` and `code`.
+Unfreezing an already-active secret is `secret_not_frozen`; freezing an
+already-frozen secret is `secret_frozen`. Repeating a freeze or unfreeze with
+its original `Idempotency-Key` replays the stored success response; reusing
+that key for any other operation is `conflict`.
+
 ### Distribute a share
 
 ```http
@@ -251,8 +286,9 @@ its integrity:
 ```
 
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
-`approvals_consumed`, `secret_reconstructed`, `secret_rotated` and
-`reconstruction_failed`. Sequences start at 1 and have no gaps. Each event
+`approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
+`reconstruction_failed`, `secret_frozen`, `secret_unfrozen` and
+`operation_blocked`. Sequences start at 1 and have no gaps. Each event
 carries `previous_hash` and
 `hash = sha256("<previous_hash>|<sequence>|<type>|<canonical payload>|<occurred_at>")`,
 where the canonical payload is the JSON text with sorted keys and compact
@@ -260,21 +296,28 @@ where the canonical payload is the JSON text with sorted keys and compact
 an edited event is detectable. A failed reconstruction is recorded when the
 failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 `stale_share`, `share_not_distributed`, `share_mismatch`,
-`integrity_failure`); malformed bodies are not audited.
+`integrity_failure`); malformed bodies are not audited. A freeze or unfreeze
+event carries the current `version` and the `reason`; an `operation_blocked`
+event records the blocked `operation` and its `code` (`secret_frozen`) and is
+appended even though the request is rejected.
 
 ## Data model
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, timestamps |
+| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, status, status reason/changed-at, timestamps |
 | `shares` | `share_id` | secret, version, holder, coordinate `x`, value `f(x)`, commitment, `distributed_at`, `invalidated_at` |
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
 | `idempotency` | `key` | operation name, stored response |
 
-Issuance, distribution, approval, reconstruction and rotation each run inside
-one `BEGIN IMMEDIATE` transaction, so a rejected request leaves no partial
-state. The single exception is a rejected reconstruction, whose audit event is
+Issuance, distribution, approval, reconstruction, rotation and every
+freeze/unfreeze transition each run inside one `BEGIN IMMEDIATE` transaction,
+so a rejected request leaves no partial state, no duplicate event and no
+response that is not committed together with its idempotency record. A write
+blocked because the secret is frozen commits only its `operation_blocked`
+event in that transaction and stores no success response. The single other
+exception is a rejected reconstruction, whose `reconstruction_failed` event is
 committed on its own after the attempt rolls back.
 
 ## Determinism
@@ -307,6 +350,8 @@ Errors use this shape:
 | `share_not_distributed` | 409 | the share exists but was never handed to its holder |
 | `share_already_distributed` | 409 | that holder already received the share for this version |
 | `duplicate_approval` | 409 | that approver already approved this version |
+| `secret_frozen` | 409 | the secret is frozen, or freeze was requested while already frozen |
+| `secret_not_frozen` | 409 | unfreeze was requested while the secret was already active |
 | `integrity_failure` | 409 | the recovered value does not match the stored commitment |
 | `internal_error` | 500 | unexpected server failure |
 

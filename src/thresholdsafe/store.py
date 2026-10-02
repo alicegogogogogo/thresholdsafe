@@ -52,6 +52,20 @@ CREATE TABLE IF NOT EXISTS idempotency (
 """
 
 
+class CommitBeforeReraise(Exception):
+    """Control-flow signal: commit the open transaction, then raise ``error``.
+
+    A rejected write may still have to persist an audit event. The service
+    appends the event inside the transaction and raises this marker so the
+    transaction context commits the event instead of rolling it back, while
+    callers still observe the original business error.
+    """
+
+    def __init__(self, error: BaseException):
+        super().__init__(str(error))
+        self.error = error
+
+
 class Store:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
@@ -66,6 +80,9 @@ class Store:
         self.connection.execute("BEGIN IMMEDIATE")
         try:
             yield self.connection
+        except CommitBeforeReraise as signal:
+            self.connection.execute("COMMIT")
+            raise signal.error from None
         except Exception:
             self.connection.execute("ROLLBACK")
             raise

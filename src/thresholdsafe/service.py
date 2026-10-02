@@ -12,6 +12,8 @@ from .errors import (
     InsufficientShares,
     IntegrityFailure,
     NotFoundError,
+    SecretFrozen,
+    SecretNotFrozen,
     ShareAlreadyDistributed,
     ShareMismatch,
     ShareNotDistributed,
@@ -19,9 +21,17 @@ from .errors import (
     ThresholdSafeError,
     ValidationError,
 )
-from .model import RotationSpec, SecretSpec, ShareClaim, parse_share_claims, resolve_policy, single_field
+from .model import (
+    RotationSpec,
+    SecretSpec,
+    ShareClaim,
+    parse_share_claims,
+    reason_field,
+    resolve_policy,
+    single_field,
+)
 from .shamir import RandomSource, SeededRandomSource, SystemRandomSource
-from .store import Store
+from .store import CommitBeforeReraise, Store
 
 ZERO_HASH = "0" * 64
 
@@ -37,6 +47,10 @@ AUDITED_FAILURES = frozenset(
         "integrity_failure",
     }
 )
+
+# Write entry points that must be refused while a secret is frozen. The audit
+# payload of a blocked attempt records the operation under these names.
+FROZEN_OPERATIONS = ("distribute_share", "record_approval", "reconstruct", "rotate")
 
 
 def _share_id(secret_id: str, version: int, holder: str) -> str:
@@ -76,6 +90,9 @@ class ThresholdSafe:
                 "approvals_required": spec.approvals_required,
                 "secret_digest": _secret_digest(spec.secret),
                 "secret_length": len(spec.secret),
+                "status": "active",
+                "status_reason": None,
+                "status_changed_at": now,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -115,6 +132,7 @@ class ThresholdSafe:
 
         def distribute() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(secret_id, document, "distribute_share")
             if holder not in document["holders"]:
                 raise ValidationError(f"holder {holder} is not registered for secret {secret_id}")
             share_id = _share_id(secret_id, document["version"], holder)
@@ -154,6 +172,7 @@ class ThresholdSafe:
 
         def record() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(secret_id, document, "record_approval")
             if approver not in document["holders"]:
                 raise ValidationError(f"approver {approver} is not a registered holder of secret {secret_id}")
             version = document["version"]
@@ -206,6 +225,7 @@ class ThresholdSafe:
 
     def _reconstruct(self, secret_id: str, claims: list[ShareClaim]) -> dict[str, Any]:
         document = self._document(secret_id)
+        self._require_active(secret_id, document, "reconstruct")
         version, threshold = document["version"], document["threshold"]
         points: list[tuple[int, int]] = []
         used: list[str] = []
@@ -271,6 +291,7 @@ class ThresholdSafe:
 
         def apply() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(secret_id, document, "rotate")
             previous = document["version"]
             required = document["approvals_required"]
             recorded = self._approval_count(secret_id, previous)
@@ -320,6 +341,44 @@ class ThresholdSafe:
 
         return self._idempotent(key, operation, apply)
 
+    # ---------------------------------------------------------- freeze/unfreeze
+    def freeze(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        return self._change_status(secret_id, raw, key, freeze=True)
+
+    def unfreeze(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        return self._change_status(secret_id, raw, key, freeze=False)
+
+    def _change_status(self, secret_id: str, raw: Any, key: str | None, *, freeze: bool) -> dict[str, Any]:
+        self._require_key(key)
+        reason = reason_field(raw)
+        self._document(secret_id)  # 404 before the transaction
+        target = "frozen" if freeze else "active"
+        event_type = "secret_frozen" if freeze else "secret_unfrozen"
+        operation = f"{event_type}:{secret_id}"
+
+        def change() -> dict[str, Any]:
+            document = self._document(secret_id)
+            current = document.get("status", "active")
+            if current == target:
+                if freeze:
+                    raise SecretFrozen(f"secret {secret_id} is already frozen")
+                raise SecretNotFrozen(f"secret {secret_id} is not frozen")
+            now = self.store.now()
+            document.update({
+                "status": target,
+                "status_reason": reason,
+                "status_changed_at": now,
+                "updated_at": now,
+            })
+            self.store.connection.execute(
+                "UPDATE secrets SET document = ?, updated_at = ? WHERE id = ?",
+                (self.store.encode(document), now, secret_id),
+            )
+            self._append(secret_id, event_type, {"version": document["version"], "reason": reason})
+            return self._record(secret_id)
+
+        return self._idempotent(key, operation, change)
+
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
         document = self._document(secret_id)
@@ -353,6 +412,20 @@ class ThresholdSafe:
         }
 
     # ------------------------------------------------------------------ helpers
+    def _require_active(self, secret_id: str, document: dict[str, Any], operation: str) -> None:
+        """Refuse a write entry point while the secret is frozen.
+
+        The ``operation_blocked`` event is appended inside the caller's
+        transaction and committed with it via :class:`CommitBeforeReraise`, so
+        the rejection is durable even though no business state changes and no
+        success response is stored.
+        """
+        if document.get("status", "active") == "frozen":
+            self._append(secret_id, "operation_blocked", {"operation": operation, "code": "secret_frozen"})
+            raise CommitBeforeReraise(
+                SecretFrozen(f"secret {secret_id} is frozen; {operation} is blocked until it is unfrozen")
+            )
+
     def _source(self, seed: int | None) -> RandomSource:
         return SeededRandomSource(seed) if seed is not None else self.source
 
@@ -398,6 +471,9 @@ class ThresholdSafe:
             "distributed_shares": sum(1 for row in rows if row["distributed_at"] is not None),
             "approvals": {"recorded": recorded, "required": required, "satisfied": recorded >= required},
             "secret_length": document["secret_length"],
+            "status": document.get("status", "active"),
+            "status_reason": document.get("status_reason"),
+            "status_changed_at": document.get("status_changed_at", document["created_at"]),
             "created_at": document["created_at"],
             "updated_at": document["updated_at"],
         }

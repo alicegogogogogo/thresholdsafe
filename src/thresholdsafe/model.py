@@ -41,6 +41,18 @@ def text(value: Any, field: str, limit: int = 200) -> str:
     return value
 
 
+def reason_field(raw: Any) -> str:
+    if not isinstance(raw, dict) or set(raw) != {"reason"}:
+        raise ValidationError("request body must contain exactly reason")
+    value = raw["reason"]
+    if not isinstance(value, str):
+        raise ValidationError("reason must be a non-empty string of at most 200 characters")
+    reason = value.strip()
+    if not reason or len(reason) > 200:
+        raise ValidationError("reason must be a non-empty string of at most 200 characters")
+    return reason
+
+
 def seed_value(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 2**63:
         raise ValidationError("seed must be an integer between 0 and 2**63")
