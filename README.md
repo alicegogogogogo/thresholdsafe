@@ -34,6 +34,9 @@ The initial release supports a compact public contract:
   unfreezing leaves the current version, shares and approvals untouched;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
+- a secret can be exported as a self-contained, checksummed JSON backup, and
+  any backup document can be verified independently without touching service
+  state;
 - the plaintext secret is never written to the database: only its SHA-256
   commitment and byte length are kept, to verify what reconstruction recovers.
 
@@ -339,6 +342,56 @@ failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 `integrity_failure`); malformed bodies are not audited. A custody write
 rejected because the secret is frozen is recorded as `operation_blocked`.
 
+### Export a backup
+
+```http
+GET /secrets/prod-db-root/backup
+```
+
+Returns a self-contained JSON backup of one secret, intended for offline
+custody and independent verification. Exporting is read-only: it needs no
+`Idempotency-Key`, appends no audit event, and works while the secret is
+frozen. Unknown secrets return 404 `not_found`.
+
+The top level carries exactly `backup_version` (always
+`thresholdsafe-backup-v1`), `generated_at` (the usual UTC timestamp),
+`secret`, `shares`, `approvals`, `audit_events` and `checksum`. `secret` is
+the stored record — including `secret_length` and `secret_digest`, never the
+plaintext. `shares` covers every version, each entry keeping `share_id`,
+`secret_id`, `version`, `holder`, `coordinate`, `value`, `commitment`,
+`distributed_at` and `invalidated_at`, so issued, distributed and invalidated
+shares stay distinguishable. `approvals` and `audit_events` are the complete
+tables for the secret. `checksum` is the lowercase hex SHA-256 of the other
+top-level values encoded as canonical JSON (sorted keys, compact separators),
+so field order and whitespace are irrelevant.
+
+> **Warning.** Share values are part of the backup, so the document is
+> sensitive material: anyone holding it can recover the secret with
+> `threshold` shares. Store it like the secret itself.
+
+### Verify a backup
+
+```http
+POST /backups/verify
+Content-Type: application/json
+
+{"backup": { ...exported document... }}
+```
+
+Independently verifies a backup document. The body must contain exactly
+`backup`; no `Idempotency-Key` is required, and the service neither reads nor
+modifies any state — nothing is audited and no idempotency record is stored.
+A malformed document (missing, extra or wrongly typed fields, an unsupported
+`backup_version`) is `400 validation_error`. A well-formed document whose
+checksum does not match, or whose secret ownership, version continuity,
+`share_id` ownership, share value/commitment pairs, approver ownership or
+audit ordering and chain hashes are inconsistent, is `409 backup_integrity`;
+verification never partially accepts. A valid backup returns HTTP 200:
+
+```json
+{"valid":true,"secret_id":"prod-db-root","version":1,"share_count":5,"approval_count":2,"event_count":8}
+```
+
 ## Data model
 
 | Table | Key | Contents |
@@ -391,6 +444,7 @@ Errors use this shape:
 | `integrity_failure` | 409 | the recovered value does not match the stored commitment |
 | `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
 | `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
+| `backup_integrity` | 409 | a structurally valid backup fails checksum or internal consistency checks |
 | `internal_error` | 500 | unexpected server failure |
 
 ## Tests

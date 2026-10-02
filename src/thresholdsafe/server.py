@@ -44,9 +44,13 @@ class Handler(BaseHTTPRequestHandler):
             return 201, self.service.create_secret(self._body(), key)
         if len(parts) == 2 and parts[0] == "secrets" and self.command == "GET":
             return 200, self.service.get_secret(parts[1])
+        if self.command == "POST" and parts == ["backups", "verify"]:
+            return 200, self.service.verify_backup(self._body())
         if len(parts) == 3 and parts[0] == "secrets":
             if parts[2] == "audit" and self.command == "GET":
                 return 200, self.service.audit(parts[1])
+            if parts[2] == "backup" and self.command == "GET":
+                return 200, self.service.export_backup(parts[1])
             if self.command == "POST":
                 body = self._body()
                 actions = {

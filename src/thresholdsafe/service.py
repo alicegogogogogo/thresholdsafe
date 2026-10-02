@@ -5,6 +5,14 @@ import sqlite3
 from typing import Any, Callable
 
 from . import shamir
+from .backup import (
+    BACKUP_VERSION,
+    ZERO_HASH,
+    event_hash as _event_hash,
+    share_commitment as _share_commitment,
+    stamp as _stamp,
+    verify as _verify,
+)
 from .errors import (
     ConflictError,
     DuplicateApproval,
@@ -33,8 +41,6 @@ from .model import (
 from .shamir import RandomSource, SeededRandomSource, SystemRandomSource
 from .store import Store
 
-ZERO_HASH = "0" * 64
-
 # Rejected attempts that are custody decisions rather than malformed requests
 # are worth recording even though they changed nothing else.
 AUDITED_FAILURES = frozenset(
@@ -55,14 +61,6 @@ def _share_id(secret_id: str, version: int, holder: str) -> str:
 
 def _secret_digest(secret: bytes) -> str:
     return hashlib.sha256(b"thresholdsafe:v1:secret:" + secret).hexdigest()
-
-
-def _share_commitment(secret_id: str, version: int, holder: str, value: str) -> str:
-    return hashlib.sha256(f"thresholdsafe:v1:share:{secret_id}:{version}:{holder}:{value}".encode()).hexdigest()
-
-
-def _event_hash(previous: str, sequence: int, event_type: str, encoded: str, occurred_at: str) -> str:
-    return hashlib.sha256(f"{previous}|{sequence}|{event_type}|{encoded}|{occurred_at}".encode()).hexdigest()
 
 
 class ThresholdSafe:
@@ -408,6 +406,57 @@ class ThresholdSafe:
             return self._record(secret_id)
 
         return self._idempotent(key, operation, apply, blocked=(secret_id, "rotate"))
+
+    # ------------------------------------------------------------------ backup
+    def export_backup(self, secret_id: str) -> dict[str, Any]:
+        """Export a self-contained, checksummed backup of one secret.
+
+        Read-only: a frozen secret exports exactly like an active one, and no
+        audit event or idempotency record is written. The plaintext secret is
+        never included — only its digest and length — but share values are, so
+        the backup is sensitive material.
+        """
+        document = self._document(secret_id)
+        shares = self.store.connection.execute(
+            "SELECT share_id, secret_id, version, holder, coordinate, value, commitment, "
+            "distributed_at, invalidated_at FROM shares WHERE secret_id = ? "
+            "ORDER BY version, coordinate",
+            (secret_id,),
+        ).fetchall()
+        approvals = self.store.connection.execute(
+            "SELECT secret_id, version, approver, created_at, consumed_at FROM approvals "
+            "WHERE secret_id = ? ORDER BY version, approver",
+            (secret_id,),
+        ).fetchall()
+        events = self.store.connection.execute(
+            "SELECT sequence, type, payload, occurred_at, previous_hash, hash FROM audit_events "
+            "WHERE secret_id = ? ORDER BY sequence",
+            (secret_id,),
+        ).fetchall()
+        return _stamp({
+            "backup_version": BACKUP_VERSION,
+            "generated_at": self.store.now(),
+            "secret": document,
+            "shares": [dict(row) for row in shares],
+            "approvals": [dict(row) for row in approvals],
+            "audit_events": [
+                {
+                    "sequence": row["sequence"],
+                    "type": row["type"],
+                    "payload": self.store.decode(row["payload"]),
+                    "occurred_at": row["occurred_at"],
+                    "previous_hash": row["previous_hash"],
+                    "hash": row["hash"],
+                }
+                for row in events
+            ],
+        })
+
+    def verify_backup(self, raw: Any) -> dict[str, Any]:
+        """Independently verify a backup document without touching service state."""
+        if not isinstance(raw, dict) or set(raw) != {"backup"}:
+            raise ValidationError("backup verification body must contain exactly backup")
+        return _verify(raw["backup"])
 
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
