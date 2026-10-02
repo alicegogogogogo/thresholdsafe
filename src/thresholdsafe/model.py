@@ -62,6 +62,17 @@ def single_field(raw: Any, field: str, description: str) -> str:
     return identifier(raw[field], field)
 
 
+def reason_field(raw: Any) -> str:
+    if not isinstance(raw, dict) or set(raw) != {"reason"}:
+        raise ValidationError("freeze request body must contain exactly reason")
+    if not isinstance(raw["reason"], str):
+        raise ValidationError("reason must be a non-empty string of at most 200 characters")
+    reason = raw["reason"].strip()
+    if not reason or len(reason) > 200:
+        raise ValidationError("reason must be a non-empty string of at most 200 characters")
+    return reason
+
+
 def no_unknown_fields(raw: Any, allowed: set[str], description: str) -> None:
     unknown = sorted(set(raw) - allowed)
     if unknown:

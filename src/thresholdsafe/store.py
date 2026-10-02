@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,22 +56,40 @@ CREATE TABLE IF NOT EXISTS idempotency (
 class Store:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
-        self.connection.row_factory = sqlite3.Row
-        self.connection.execute("PRAGMA foreign_keys = ON")
-        self.connection.execute("PRAGMA journal_mode = WAL")
-        self.connection.executescript(SCHEMA)
+        self.path = path
+        self._local = threading.local()
+        # Create the schema eagerly so the file is fully initialised even when
+        # worker threads later open their own connections.
+        self._open()
+
+    def _open(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, isolation_level=None, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute("PRAGMA busy_timeout = 10000")
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.executescript(SCHEMA)
+        self._local.connection = connection
+        return connection
+
+    @property
+    def connection(self) -> sqlite3.Connection:
+        connection = getattr(self._local, "connection", None)
+        if connection is None:
+            connection = self._open()
+        return connection
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        self.connection.execute("BEGIN IMMEDIATE")
+        connection = self.connection
+        connection.execute("BEGIN IMMEDIATE")
         try:
-            yield self.connection
+            yield connection
         except Exception:
-            self.connection.execute("ROLLBACK")
+            connection.execute("ROLLBACK")
             raise
         else:
-            self.connection.execute("COMMIT")
+            connection.execute("COMMIT")
 
     @staticmethod
     def encode(value: Any) -> str:

@@ -12,6 +12,8 @@ from .errors import (
     InsufficientShares,
     IntegrityFailure,
     NotFoundError,
+    SecretFrozen,
+    SecretNotFrozen,
     ShareAlreadyDistributed,
     ShareMismatch,
     ShareNotDistributed,
@@ -19,7 +21,15 @@ from .errors import (
     ThresholdSafeError,
     ValidationError,
 )
-from .model import RotationSpec, SecretSpec, ShareClaim, parse_share_claims, resolve_policy, single_field
+from .model import (
+    RotationSpec,
+    SecretSpec,
+    ShareClaim,
+    parse_share_claims,
+    reason_field,
+    resolve_policy,
+    single_field,
+)
 from .shamir import RandomSource, SeededRandomSource, SystemRandomSource
 from .store import Store
 
@@ -76,6 +86,10 @@ class ThresholdSafe:
                 "approvals_required": spec.approvals_required,
                 "secret_digest": _secret_digest(spec.secret),
                 "secret_length": len(spec.secret),
+                "status": "active",
+                "status_reason": None,
+                "status_changed_at": now,
+                "status_epoch": 0,
                 "created_at": now,
                 "updated_at": now,
             }
@@ -106,6 +120,68 @@ class ThresholdSafe:
     def get_secret(self, secret_id: str) -> dict[str, Any]:
         return self._record(secret_id)
 
+    # ------------------------------------------------------- freeze / unfreeze
+    def freeze_secret(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        self._require_key(key)
+        reason = reason_field(raw)
+
+        def freeze_operation() -> str:
+            document = self._document(secret_id)
+            epoch = document["status_epoch"]
+            # A completed freeze carries the epoch it entered; a pending freeze
+            # while active would open the next epoch, so retries after an
+            # unfreeze cannot replay an older freeze cycle's response.
+            scope = epoch if document["status"] == "frozen" else epoch + 1
+            return f"freeze-secret:{secret_id}:e{scope}"
+
+        def freeze() -> dict[str, Any]:
+            document = self._document(secret_id)
+            if document["status"] == "frozen":
+                raise SecretFrozen(f"secret {secret_id} is already frozen")
+            now = self.store.now()
+            document["status"] = "frozen"
+            document["status_reason"] = reason
+            document["status_changed_at"] = now
+            document["status_epoch"] = document["status_epoch"] + 1
+            self.store.connection.execute(
+                "UPDATE secrets SET document = ? WHERE id = ?",
+                (self.store.encode(document), secret_id),
+            )
+            self._append(secret_id, "secret_frozen", {"version": document["version"], "reason": reason})
+            return self._record(secret_id, document)
+
+        return self._idempotent(key, freeze_operation, freeze)
+
+    def unfreeze_secret(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        self._require_key(key)
+        reason = reason_field(raw)
+
+        def unfreeze_operation() -> str:
+            document = self._document(secret_id)
+            return f"unfreeze-secret:{secret_id}:e{document['status_epoch']}"
+
+        def unfreeze() -> dict[str, Any]:
+            document = self._document(secret_id)
+            if document["status"] != "frozen":
+                raise SecretNotFrozen(f"secret {secret_id} is not frozen")
+            now = self.store.now()
+            document["status"] = "active"
+            document["status_reason"] = reason
+            document["status_changed_at"] = now
+            self.store.connection.execute(
+                "UPDATE secrets SET document = ? WHERE id = ?",
+                (self.store.encode(document), secret_id),
+            )
+            self._append(secret_id, "secret_unfrozen", {"version": document["version"], "reason": reason})
+            return self._record(secret_id, document)
+
+        return self._idempotent(key, unfreeze_operation, unfreeze)
+
+    @staticmethod
+    def _require_active(document: dict[str, Any], secret_id: str) -> None:
+        if document["status"] == "frozen":
+            raise SecretFrozen(f"secret {secret_id} is frozen")
+
     # ------------------------------------------------------------- distribution
     def distribute_share(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
         self._require_key(key)
@@ -115,6 +191,7 @@ class ThresholdSafe:
 
         def distribute() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(document, secret_id)
             if holder not in document["holders"]:
                 raise ValidationError(f"holder {holder} is not registered for secret {secret_id}")
             share_id = _share_id(secret_id, document["version"], holder)
@@ -143,7 +220,9 @@ class ThresholdSafe:
                 },
             }
 
-        return self._idempotent(key, operation, distribute)
+        return self._idempotent(
+            key, operation, distribute, blocked=(secret_id, "distribute_share")
+        )
 
     # ---------------------------------------------------------------- approvals
     def record_approval(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
@@ -154,6 +233,7 @@ class ThresholdSafe:
 
         def record() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(document, secret_id)
             if approver not in document["holders"]:
                 raise ValidationError(f"approver {approver} is not a registered holder of secret {secret_id}")
             version = document["version"]
@@ -190,7 +270,9 @@ class ThresholdSafe:
                 "recorded_at": now,
             }
 
-        return self._idempotent(key, operation, record)
+        return self._idempotent(
+            key, operation, record, blocked=(secret_id, "record_approval")
+        )
 
     # ------------------------------------------------------------- reconstruct
     def reconstruct(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
@@ -198,7 +280,12 @@ class ThresholdSafe:
         claims = parse_share_claims(raw)
         self._document(secret_id)
         try:
-            return self._idempotent(key, f"reconstruct:{secret_id}", lambda: self._reconstruct(secret_id, claims))
+            return self._idempotent(
+                key,
+                f"reconstruct:{secret_id}",
+                lambda: self._reconstruct(secret_id, claims),
+                blocked=(secret_id, "reconstruct"),
+            )
         except ThresholdSafeError as error:
             if error.code in AUDITED_FAILURES:
                 self._audit_failure(secret_id, error, len(claims))
@@ -206,6 +293,7 @@ class ThresholdSafe:
 
     def _reconstruct(self, secret_id: str, claims: list[ShareClaim]) -> dict[str, Any]:
         document = self._document(secret_id)
+        self._require_active(document, secret_id)
         version, threshold = document["version"], document["threshold"]
         points: list[tuple[int, int]] = []
         used: list[str] = []
@@ -271,6 +359,7 @@ class ThresholdSafe:
 
         def apply() -> dict[str, Any]:
             document = self._document(secret_id)
+            self._require_active(document, secret_id)
             previous = document["version"]
             required = document["approvals_required"]
             recorded = self._approval_count(secret_id, previous)
@@ -318,7 +407,7 @@ class ThresholdSafe:
             })
             return self._record(secret_id)
 
-        return self._idempotent(key, operation, apply)
+        return self._idempotent(key, operation, apply, blocked=(secret_id, "rotate"))
 
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
@@ -379,8 +468,9 @@ class ThresholdSafe:
         except OverflowError as error:
             raise IntegrityFailure("stored shares do not reproduce the recorded secret") from error
 
-    def _record(self, secret_id: str) -> dict[str, Any]:
-        document = self._document(secret_id)
+    def _record(self, secret_id: str, document: dict[str, Any] | None = None) -> dict[str, Any]:
+        if document is None:
+            document = self._document(secret_id)
         rows = self.store.connection.execute(
             "SELECT distributed_at FROM shares WHERE secret_id = ? AND version = ?",
             (secret_id, document["version"]),
@@ -398,6 +488,9 @@ class ThresholdSafe:
             "distributed_shares": sum(1 for row in rows if row["distributed_at"] is not None),
             "approvals": {"recorded": recorded, "required": required, "satisfied": recorded >= required},
             "secret_length": document["secret_length"],
+            "status": document["status"],
+            "status_reason": document["status_reason"],
+            "status_changed_at": document["status_changed_at"],
             "created_at": document["created_at"],
             "updated_at": document["updated_at"],
         }
@@ -449,22 +542,43 @@ class ThresholdSafe:
              _event_hash(previous, sequence, event_type, encoded, occurred_at)),
         )
 
-    def _idempotent(self, key: str | None, operation: str, action: Callable[[], dict[str, Any]]) -> dict[str, Any]:
+    def _idempotent(
+        self,
+        key: str | None,
+        operation: str | Callable[[], str],
+        action: Callable[[], dict[str, Any]],
+        blocked: tuple[str, str] | None = None,
+    ) -> dict[str, Any]:
         self._require_key(key)
+        frozen_error: SecretFrozen | None = None
         with self.store.transaction() as connection:
+            operation_name = operation() if callable(operation) else operation
             existing = connection.execute(
                 "SELECT operation, response FROM idempotency WHERE key = ?", (key,)
             ).fetchone()
             if existing:
-                if existing["operation"] != operation:
+                if existing["operation"] != operation_name:
                     raise ConflictError("idempotency key was already used for another operation")
                 return self.store.decode(existing["response"])
-            response = action()
-            connection.execute(
-                "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
-                (key, operation, self.store.encode(response)),
-            )
-            return response
+            try:
+                response = action()
+            except SecretFrozen as error:
+                # The guard is the first thing the action checks, so nothing was
+                # mutated. Commit (at most) the operation_blocked event, store no
+                # idempotency record, and surface the rejection after commit.
+                frozen_error = error
+                if blocked is not None:
+                    secret_id, operation_name_recorded = blocked
+                    self._append(secret_id, "operation_blocked",
+                                 {"operation": operation_name_recorded, "code": error.code})
+            else:
+                connection.execute(
+                    "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
+                    (key, operation_name, self.store.encode(response)),
+                )
+                return response
+        assert frozen_error is not None
+        raise frozen_error
 
     @staticmethod
     def _require_key(key: str | None) -> None:

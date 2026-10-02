@@ -29,6 +29,9 @@ The initial release supports a compact public contract:
   reconstruction or rotation;
 - rotation issues a new version, invalidates every previous share, and is
   itself gated by the approval policy;
+- a secret can be emergency-frozen: while `frozen`, share distribution,
+  approvals, reconstruction and rotation all return `409 secret_frozen`, and
+  unfreezing leaves the current version, shares and approvals untouched;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
 - the plaintext secret is never written to the database: only its SHA-256
@@ -94,7 +97,7 @@ Returns HTTP 201 with the custody record, which never contains share material
 or the secret itself:
 
 ```json
-{"id":"prod-db-root","name":"Production database root key","version":1,"threshold":3,"holders":["alice","bob","carol","dave","erin"],"approvals_required":2,"share_count":5,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":13,"created_at":"2026-10-02T05:53:59.148364Z","updated_at":"2026-10-02T05:53:59.148364Z"}
+{"id":"prod-db-root","name":"Production database root key","version":1,"threshold":3,"holders":["alice","bob","carol","dave","erin"],"approvals_required":2,"share_count":5,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":13,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:53:59.148364Z","created_at":"2026-10-02T05:53:59.148364Z","updated_at":"2026-10-02T05:53:59.148364Z"}
 ```
 
 ### Inspect a secret
@@ -105,7 +108,78 @@ GET /secrets/prod-db-root
 
 Returns the same custody record, so a client can see the current version, the
 roster, how many shares have been distributed, and whether the approval policy
-is currently satisfied. Unknown secrets return 404.
+is currently satisfied. The record also carries `status` (`active` or
+`frozen`), `status_reason` (the reason recorded by the latest freeze or
+unfreeze, or `null` when the secret has never been frozen) and
+`status_changed_at`. Unknown secrets return 404.
+
+### Freeze a secret
+
+```http
+POST /secrets/prod-db-root/freeze
+Idempotency-Key: demo-freeze
+Content-Type: application/json
+
+{"reason": "suspected holder compromise"}
+```
+
+An emergency freeze blocks every custody write while an incident is
+investigated. The body must contain exactly `reason`: a string whose
+whitespace-trimmed form is non-empty and at most 200 characters; the trimmed
+value is what is stored. Returns HTTP 200 with the custody record, now
+`"status": "frozen"`, and appends a `secret_frozen` event carrying
+`{"version", "reason"}`.
+
+Freezing changes only `status`, `status_reason` and `status_changed_at`. The
+current version, threshold, holders, issued and distributed shares, recorded
+approvals, secret length and the secret commitment are all left untouched.
+
+### Unfreeze a secret
+
+```http
+POST /secrets/prod-db-root/unfreeze
+Idempotency-Key: demo-unfreeze
+Content-Type: application/json
+
+{"reason": "investigation complete, no compromise"}
+```
+
+Returns the custody record to `"status": "active"` and appends a
+`secret_unfrozen` event with `{"version", "reason"}`. Already distributed
+shares and unconsumed approvals keep working under the existing rules; no
+version or policy change takes place.
+
+### Behaviour while frozen
+
+While a secret is frozen, the four write endpoints each return
+`409 secret_frozen` with the standard error shape and change nothing:
+
+- `POST /secrets/{id}/shares`
+- `POST /secrets/{id}/approvals`
+- `POST /secrets/{id}/reconstruct`
+- `POST /secrets/{id}/rotate`
+
+Each rejected attempt appends an `operation_blocked` event with
+`{"operation", "code"}` (`operation` is one of `distribute_share`,
+`record_approval`, `reconstruct`, `rotate`; `code` is `secret_frozen`). No
+success is recorded, no idempotency record is stored, and no share, approval,
+version or commitment changes. Repeating the rejected request (even with the
+same `Idempotency-Key`) is blocked again and appends another event. Once the
+secret is unfrozen, that same key performs the operation normally.
+
+State transitions themselves follow the status contract:
+
+| Request | Current status | Result |
+| --- | --- | --- |
+| freeze | `active` | 200, becomes `frozen` |
+| freeze | `frozen` | 409 `secret_frozen` |
+| unfreeze | `frozen` | 200, becomes `active` |
+| unfreeze | `active` | 409 `secret_not_frozen` |
+
+As elsewhere, repeating the same transition with the same `Idempotency-Key`
+replays the stored success response; using the key for anything else,
+including the opposite transition or a later freeze cycle after an unfreeze,
+is `409 conflict`.
 
 ### Distribute a share
 
@@ -180,14 +254,15 @@ this order and the first failure is returned:
 1. the `Idempotency-Key` header is present (400 `validation_error`);
 2. body shape and share identifiers (400 `validation_error`);
 3. the secret exists (404 `not_found`);
-4. every submitted share exists and belongs to this secret (404 `not_found`);
-5. every share belongs to the current version (409 `stale_share`);
-6. every share was distributed to its holder (409 `share_not_distributed`);
-7. every value matches the commitment stored at issuance (400 `share_mismatch`);
-8. at least `threshold` shares were submitted (409 `insufficient_shares`);
-9. at least `approvals_required` approvals exist for the version
-   (409 `insufficient_approvals`);
-10. the recovered integer matches the stored commitment and byte length
+4. the secret is not frozen (409 `secret_frozen`);
+5. every submitted share exists and belongs to this secret (404 `not_found`);
+6. every share belongs to the current version (409 `stale_share`);
+7. every share was distributed to its holder (409 `share_not_distributed`);
+8. every value matches the commitment stored at issuance (400 `share_mismatch`);
+9. at least `threshold` shares were submitted (409 `insufficient_shares`);
+10. at least `approvals_required` approvals exist for the version
+    (409 `insufficient_approvals`);
+11. the recovered integer matches the stored commitment and byte length
     (409 `integrity_failure`).
 
 More than `threshold` shares is allowed; extras only add redundancy. Shares
@@ -226,7 +301,7 @@ approvals currently required for the version it replaces, and those approvals
 are consumed. Returns HTTP 200 with the new custody record:
 
 ```json
-{"id":"prod-db-root","name":"Production database root key","version":2,"threshold":2,"holders":["frank","grace","heidi"],"approvals_required":2,"share_count":3,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":16,"created_at":"2026-10-02T05:54:08.150075Z","updated_at":"2026-10-02T05:54:08.384263Z"}
+{"id":"prod-db-root","name":"Production database root key","version":2,"threshold":2,"holders":["frank","grace","heidi"],"approvals_required":2,"share_count":3,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":16,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:54:08.150075Z","created_at":"2026-10-02T05:54:08.150075Z","updated_at":"2026-10-02T05:54:08.384263Z"}
 ```
 
 Rotation increments the version, invalidates every share of the previous
@@ -251,7 +326,8 @@ its integrity:
 ```
 
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
-`approvals_consumed`, `secret_reconstructed`, `secret_rotated` and
+`approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
+`secret_frozen`, `secret_unfrozen`, `operation_blocked` and
 `reconstruction_failed`. Sequences start at 1 and have no gaps. Each event
 carries `previous_hash` and
 `hash = sha256("<previous_hash>|<sequence>|<type>|<canonical payload>|<occurred_at>")`,
@@ -260,22 +336,27 @@ where the canonical payload is the JSON text with sorted keys and compact
 an edited event is detectable. A failed reconstruction is recorded when the
 failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 `stale_share`, `share_not_distributed`, `share_mismatch`,
-`integrity_failure`); malformed bodies are not audited.
+`integrity_failure`); malformed bodies are not audited. A custody write
+rejected because the secret is frozen is recorded as `operation_blocked`.
 
 ## Data model
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, timestamps |
+| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, status (`active`/`frozen`), status reason and change timestamp, timestamps |
 | `shares` | `share_id` | secret, version, holder, coordinate `x`, value `f(x)`, commitment, `distributed_at`, `invalidated_at` |
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
 | `idempotency` | `key` | operation name, stored response |
 
-Issuance, distribution, approval, reconstruction and rotation each run inside
-one `BEGIN IMMEDIATE` transaction, so a rejected request leaves no partial
-state. The single exception is a rejected reconstruction, whose audit event is
-committed on its own after the attempt rolls back.
+Issuance, distribution, approval, reconstruction, rotation and freeze or
+unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
+request leaves no partial state and every request observes a complete
+pre- or post-transition snapshot. A write rejected because the secret is
+frozen commits in that same transaction only its `operation_blocked` event,
+with no idempotency record. The single case with a separate transaction is a
+rejected reconstruction, whose audit event is committed on its own after the
+attempt rolls back.
 
 ## Determinism
 
@@ -308,6 +389,8 @@ Errors use this shape:
 | `share_already_distributed` | 409 | that holder already received the share for this version |
 | `duplicate_approval` | 409 | that approver already approved this version |
 | `integrity_failure` | 409 | the recovered value does not match the stored commitment |
+| `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
+| `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
 | `internal_error` | 500 | unexpected server failure |
 
 ## Tests

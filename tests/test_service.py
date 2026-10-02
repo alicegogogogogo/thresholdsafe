@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from thresholdsafe.errors import ThresholdSafeError
+from thresholdsafe.errors import SecretFrozen, SecretNotFrozen, ThresholdSafeError
 from thresholdsafe.service import ThresholdSafe
 
 HOLDERS = ["alice", "bob", "carol", "dave", "erin"]
@@ -54,6 +54,12 @@ class ThresholdSafeTests(unittest.TestCase):
 
     def reconstruct(self, issued, holders, key):
         return self.service.reconstruct("prod-db-root", {"shares": self.claims(issued, holders)}, key)
+
+    def freeze(self, reason="security incident under investigation", key="freeze-1"):
+        return self.service.freeze_secret("prod-db-root", {"reason": reason}, key)
+
+    def unfreeze(self, reason="incident resolved", key="unfreeze-1"):
+        return self.service.unfreeze_secret("prod-db-root", {"reason": reason}, key)
 
     def assert_code(self, code, function, *args):
         with self.assertRaises(ThresholdSafeError) as captured:
@@ -266,6 +272,268 @@ class ThresholdSafeTests(unittest.TestCase):
         self.create()
         self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"reason": "x"}, "rotate-1")
         self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"threshold": 1}, "rotate-2")
+
+    # ---------------------------------------------------------- freeze lifecycle
+    def test_new_secret_starts_active_without_a_reason(self):
+        record = self.create()
+        self.assertEqual("active", record["status"])
+        self.assertIsNone(record["status_reason"])
+        self.assertEqual(record["created_at"], record["status_changed_at"])
+        self.assertEqual(record, self.service.get_secret("prod-db-root"))
+
+    def test_freeze_sets_status_reason_and_timestamp(self):
+        self.create()
+        before = self.service.get_secret("prod-db-root")
+        frozen = self.freeze()
+        self.assertEqual("frozen", frozen["status"])
+        self.assertEqual("security incident under investigation", frozen["status_reason"])
+        self.assertNotEqual(before["status_changed_at"], frozen["status_changed_at"])
+        self.assertEqual(frozen, self.service.get_secret("prod-db-root"))
+        # Custody fields are untouched by the transition.
+        self.assertEqual(1, frozen["version"])
+        self.assertEqual(3, frozen["threshold"])
+        self.assertEqual(HOLDERS, frozen["holders"])
+        self.assertEqual(5, frozen["share_count"])
+        self.assertEqual(0, frozen["distributed_shares"])
+
+    def test_unfreeze_returns_to_active(self):
+        self.create()
+        self.freeze()
+        active = self.unfreeze()
+        self.assertEqual("active", active["status"])
+        self.assertEqual("incident resolved", active["status_reason"])
+        self.assertEqual(active, self.service.get_secret("prod-db-root"))
+
+    def test_freeze_is_idempotent_for_the_same_transition(self):
+        self.create()
+        first = self.freeze(key="same-key")
+        self.assertEqual(first, self.service.freeze_secret("prod-db-root", {"reason": "later reason"}, "same-key"))
+        self.assertEqual(
+            "security incident under investigation",
+            self.service.get_secret("prod-db-root")["status_reason"],
+        )
+
+    def test_unfreeze_is_idempotent_for_the_same_transition(self):
+        self.create()
+        self.freeze()
+        first = self.unfreeze(key="same-key")
+        self.assertEqual(first, self.service.unfreeze_secret("prod-db-root", {"reason": "later"}, "same-key"))
+
+    def test_repeated_freeze_is_secret_frozen_and_repeated_unfreeze_is_secret_not_frozen(self):
+        self.create()
+        self.freeze(key="freeze-1")
+        self.assert_code("secret_frozen", self.freeze, "different reason", "freeze-2")
+        self.unfreeze(key="unfreeze-1")
+        self.assert_code("secret_not_frozen", self.unfreeze, "again", "unfreeze-2")
+
+    def test_reusing_a_key_for_the_opposite_transition_is_a_conflict(self):
+        self.create()
+        self.freeze(key="shared")
+        self.assert_code("conflict", self.unfreeze, "resolved", "shared")
+
+    def test_reusing_a_freeze_key_after_a_new_cycle_is_a_conflict(self):
+        self.create()
+        self.freeze(key="freeze-cycle")
+        self.unfreeze(key="unfreeze-1")
+        # The old key belongs to the first freeze cycle, not the second.
+        self.assert_code("conflict", self.freeze, "second incident", "freeze-cycle")
+        # A fresh key opens the second freeze cycle normally.
+        second = self.freeze(key="freeze-2")
+        self.assertEqual("frozen", second["status"])
+
+    def test_freeze_reasons_are_trimmed_and_validated(self):
+        self.create()
+        record = self.service.freeze_secret("prod-db-root", {"reason": "  urgent incident  "}, "freeze-1")
+        self.assertEqual("urgent incident", record["status_reason"])
+        cases = [
+            {},
+            {"reason": "   "},
+            {"reason": ""},
+            {"reason": "x" * 201},
+            {"reason": 12},
+            {"reason": None},
+            {"reason": "ok", "extra": 1},
+            ["frozen"],
+        ]
+        for index, body in enumerate(cases):
+            self.assert_code("validation_error", self.service.freeze_secret, "prod-db-root", body, f"f-{index}")
+            self.assert_code("validation_error", self.service.unfreeze_secret, "prod-db-root", body, f"u-{index}")
+        self.assertEqual("frozen", self.service.get_secret("prod-db-root")["status"])
+
+    def test_a_200_character_reason_is_accepted(self):
+        self.create()
+        reason = "a" * 150 + " " + "b" * 49
+        self.assertEqual(200, len(reason))
+        record = self.freeze(reason=reason, key="freeze-1")
+        self.assertEqual(reason, record["status_reason"])
+
+    def test_freeze_and_unfreeze_require_an_idempotency_key(self):
+        self.create()
+        self.assert_code("validation_error", self.service.freeze_secret, "prod-db-root", {"reason": "x"}, None)
+        self.freeze()
+        self.assert_code("validation_error", self.service.unfreeze_secret, "prod-db-root", {"reason": "x"}, None)
+
+    def test_freeze_and_unfreeze_unknown_secret_is_not_found(self):
+        self.assert_code("not_found", self.service.freeze_secret, "missing", {"reason": "x"}, "k1")
+        self.assert_code("not_found", self.service.unfreeze_secret, "missing", {"reason": "x"}, "k2")
+
+    def test_frozen_blocks_the_four_write_endpoints_without_changing_state(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice"])
+        self.freeze()
+
+        claim = {"shares": self.claims(issued, ["alice", "bob", "carol"])}
+        self.assert_code("secret_frozen", self.service.distribute_share,
+                         "prod-db-root", {"holder": "dave"}, "share-dave")
+        self.assert_code("secret_frozen", self.service.record_approval,
+                         "prod-db-root", {"approver": "bob"}, "approval-bob")
+        self.assert_code("secret_frozen", self.service.reconstruct, "prod-db-root", claim, "reconstruct-1")
+        self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, "rotate-1")
+
+        record = self.service.get_secret("prod-db-root")
+        self.assertEqual("frozen", record["status"])
+        self.assertEqual(1, record["version"])
+        self.assertEqual(3, record["distributed_shares"])
+        self.assertEqual(1, record["approvals"]["recorded"])
+
+    def test_blocked_writes_do_not_consume_idempotency_keys(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.freeze()
+
+        claim = {"shares": self.claims(issued, ["alice", "bob", "carol"])}
+        self.assert_code("secret_frozen", self.service.reconstruct, "prod-db-root", claim, "shared")
+        # While still frozen every retry with the same key is blocked afresh ...
+        self.assert_code("secret_frozen", self.service.reconstruct, "prod-db-root", claim, "shared")
+        self.unfreeze()
+        # ... and after unfreezing the same key performs the operation instead
+        # of replaying a stored response.
+        result = self.service.reconstruct("prod-db-root", claim, "shared")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_blocked_writes_append_operation_blocked_events(self):
+        self.create()
+        issued = self.distribute(["alice", "bob"])
+        self.freeze()
+        self.assert_code("secret_frozen", self.service.distribute_share,
+                         "prod-db-root", {"holder": "carol"}, "share-carol")
+        self.assert_code("secret_frozen", self.service.record_approval,
+                         "prod-db-root", {"approver": "alice"}, "approval-alice")
+        self.assert_code(
+            "secret_frozen",
+            self.service.reconstruct,
+            "prod-db-root",
+            {"shares": self.claims(issued, ["alice", "bob"])},
+            "reconstruct-1",
+        )
+        self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, "rotate-1")
+        # Retrying a blocked request records another blocked event.
+        self.assert_code("secret_frozen", self.service.rotate, "prod-db-root", {}, "rotate-2")
+
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        blocked = [event for event in run["events"] if event["type"] == "operation_blocked"]
+        self.assertEqual(
+            ["distribute_share", "record_approval", "reconstruct", "rotate", "rotate"],
+            [event["payload"]["operation"] for event in blocked],
+        )
+        self.assertTrue(all(event["payload"]["code"] == "secret_frozen" for event in blocked))
+
+    def test_successful_freeze_and_unfreeze_are_audited_with_the_version(self):
+        self.create()
+        self.freeze(reason="incident-42")
+        self.unfreeze(reason="all-clear")
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        frozen_event, unfrozen_event = [
+            event for event in run["events"] if event["type"] in {"secret_frozen", "secret_unfrozen"}
+        ]
+        self.assertEqual({"version": 1, "reason": "incident-42"}, frozen_event["payload"])
+        self.assertEqual({"version": 1, "reason": "all-clear"}, unfrozen_event["payload"])
+
+    def test_unfreeze_restores_existing_shares_and_approvals(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.freeze()
+        self.unfreeze()
+        result = self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_freeze_does_not_change_version_threshold_or_secret_commitment(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        before = self.service.get_secret("prod-db-root")
+        self.freeze()
+        self.unfreeze()
+        after = self.service.get_secret("prod-db-root")
+        self.assertEqual(before["version"], after["version"])
+        self.assertEqual(before["threshold"], after["threshold"])
+        self.assertEqual(before["holders"], after["holders"])
+        self.assertEqual(before["secret_length"], after["secret_length"])
+        self.assertEqual(before["share_count"], after["share_count"])
+        self.assertEqual(before["distributed_shares"], after["distributed_shares"])
+        self.assertEqual(before["approvals"], after["approvals"])
+        result = self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_frozen_state_survives_across_service_instances(self):
+        self.create()
+        self.freeze()
+        reopened = ThresholdSafe(self.database)
+        self.assertEqual("frozen", reopened.get_secret("prod-db-root")["status"])
+        self.assert_code(
+            "secret_frozen", reopened.distribute_share, "prod-db-root", {"holder": "alice"}, "share-alice-2"
+        )
+
+    def test_concurrent_transitions_linearize_into_alternating_events(self):
+        import threading
+
+        self.create()
+        errors: list[Exception] = []
+
+        def cycle(index: int) -> None:
+            attempt = [0]
+            try:
+                # Retry through cycles another thread won: only a 200 means
+                # this thread performed the transition.
+                while True:
+                    try:
+                        self.service.freeze_secret(
+                            "prod-db-root", {"reason": f"freeze-{index}"}, f"f-{index}-{attempt[0]}"
+                        )
+                        break
+                    except SecretFrozen:
+                        attempt[0] += 1
+                attempt[0] += 1
+                while True:
+                    try:
+                        self.service.unfreeze_secret(
+                            "prod-db-root", {"reason": f"unfreeze-{index}"}, f"u-{index}-{attempt[0]}"
+                        )
+                        break
+                    except SecretNotFrozen:
+                        attempt[0] += 1
+            except Exception as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=cycle, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([], errors)
+
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        transitions = [event["type"] for event in run["events"]
+                       if event["type"] in {"secret_frozen", "secret_unfrozen"}]
+        self.assertEqual(16, len(transitions))
+        self.assertEqual(["secret_frozen", "secret_unfrozen"] * 8, transitions)
+        self.assertEqual("active", self.service.get_secret("prod-db-root")["status"])
 
     # ----------------------------------------------------------------------- audit
     def test_audit_stream_is_hash_linked_and_ordered(self):
