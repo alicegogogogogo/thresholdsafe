@@ -60,3 +60,7 @@ class SecretFrozen(ConflictError):
 
 class SecretNotFrozen(ConflictError):
     code = "secret_not_frozen"
+
+
+class PolicyDenied(ConflictError):
+    code = "policy_denied"

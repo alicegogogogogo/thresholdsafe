@@ -51,6 +51,8 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, self.service.audit(parts[1])
             if parts[2] == "backup" and self.command == "GET":
                 return 200, self.service.export_backup(parts[1])
+            if parts[2] == "policy" and self.command == "GET":
+                return 200, self.service.get_policy(parts[1])
             if self.command == "POST":
                 body = self._body()
                 actions = {

@@ -624,10 +624,12 @@ class ThresholdSafeTests(unittest.TestCase):
         self.approve(["alice", "bob"])
         backup = self.service.export_backup("prod-db-root")
         self.assertEqual(
-            {"backup_version", "generated_at", "secret", "shares", "approvals", "audit_events", "checksum"},
+            {"backup_version", "generated_at", "authorization_policy", "secret",
+             "shares", "approvals", "audit_events", "checksum"},
             set(backup),
         )
-        self.assertEqual("thresholdsafe-backup-v1", backup["backup_version"])
+        self.assertEqual("thresholdsafe-backup-v2", backup["backup_version"])
+        self.assertIsNone(backup["authorization_policy"])
         self.assertTrue(backup["generated_at"].endswith("Z"))
         self.assertNotIn(SECRET, json.dumps(backup))
         secret = backup["secret"]
@@ -706,8 +708,11 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assert_code("validation_error", self.service.verify_backup, {"backup": "not-an-object"})
         for mutate in (
             lambda b: b.pop("shares"),
+            lambda b: b.pop("authorization_policy"),
             lambda b: b.update(unexpected=True),
-            lambda b: b.update(backup_version="thresholdsafe-backup-v2"),
+            lambda b: b.update(backup_version="thresholdsafe-backup-v1"),
+            lambda b: b.update(backup_version="thresholdsafe-backup-v3"),
+            lambda b: b.update(authorization_policy={"all": []}),
             lambda b: b.update(generated_at=None),
             lambda b: b["secret"].update(version="1"),
             lambda b: b["secret"].pop("secret_digest"),
@@ -766,6 +771,207 @@ class ThresholdSafeTests(unittest.TestCase):
             json.dumps({k: v for k, v in broken.items() if k != "checksum"},
                        ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
         ).hexdigest()
+        self.assert_code("backup_integrity", self.service.verify_backup, {"backup": broken})
+
+    # ------------------------------------------------------------- authorization policy
+    RECONSTRUCT_ONLY = {"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}}
+    EXTRA_SHARES = {"fact": {"fact": "presented_shares", "op": "gte", "value": 4}}
+
+    def test_secret_without_a_policy_reports_null_and_behaves_as_before(self):
+        self.create()
+        self.assertEqual({"policy": None}, self.service.get_policy("prod-db-root"))
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.assertEqual(SECRET, self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")["secret"])
+
+    def test_policy_is_set_at_creation_and_read_back(self):
+        policy = {"all": [self.RECONSTRUCT_ONLY, self.EXTRA_SHARES]}
+        self.create(policy=policy)
+        self.assertEqual({"policy": policy}, self.service.get_policy("prod-db-root"))
+        # The custody record itself is unchanged in shape.
+        self.assertNotIn("policy", self.service.get_secret("prod-db-root"))
+
+    def test_policy_read_is_allowed_while_frozen_and_writes_nothing(self):
+        self.create(policy=self.RECONSTRUCT_ONLY)
+        self.freeze()
+        before = self.service.audit("prod-db-root")
+        self.assertEqual({"policy": self.RECONSTRUCT_ONLY}, self.service.get_policy("prod-db-root"))
+        self.assertEqual(before, self.service.audit("prod-db-root"))
+        count = self.service.store.connection.execute("SELECT COUNT(*) AS n FROM idempotency").fetchone()
+        self.assertEqual(2, count["n"])  # only the create and freeze keys
+
+    def test_policy_of_unknown_secret_is_not_found(self):
+        self.assert_code("not_found", self.service.get_policy, "missing")
+
+    def test_policy_validation_rejects_bad_expressions(self):
+        good = {"not": {"fact": {"fact": "action", "op": "ne", "value": "rotate"}}}
+        cases = [
+            "not-an-object",
+            {},
+            {"all": []},
+            {"any": []},
+            {"all": "not-a-list"},
+            {"all": [good], "not": good},
+            {"not": [good]},
+            {"not": {"unknown": {}}},
+            {"unknown": {}},
+            {"fact": {"fact": "action", "op": "eq"}},
+            {"fact": {"fact": "action", "op": "eq", "value": "reconstruct", "extra": 1}},
+            {"fact": {"fact": "owner", "op": "eq", "value": 1}},
+            {"fact": {"fact": "action", "op": "gte", "value": "reconstruct"}},
+            {"fact": {"fact": "action", "op": "eq", "value": "distribute"}},
+            {"fact": {"fact": "action", "op": "eq", "value": 1}},
+            {"fact": {"fact": "version", "op": "gt", "value": 1}},
+            {"fact": {"fact": "version", "op": "eq", "value": -1}},
+            {"fact": {"fact": "version", "op": "eq", "value": True}},
+            {"fact": {"fact": "version", "op": "eq", "value": "1"}},
+            {"fact": {"fact": "presented_shares", "op": "lte", "value": 1.5}},
+        ]
+        for index, policy in enumerate(cases):
+            self.assert_code(
+                "validation_error", self.service.create_secret, create_body(id=f"p-{index}", policy=policy), f"c-{index}"
+            )
+        self.service.create_secret(create_body(policy=good), "create-ok")
+        self.assertEqual({"policy": good}, self.service.get_policy("prod-db-root"))
+        # Rotation validates a new policy the same way.
+        self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"policy": {"all": []}}, "r-bad")
+        self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"policy": 7}, "r-bad-2")
+
+    def test_policy_denial_blocks_reconstruction_without_side_effects(self):
+        self.create(policy={"all": [self.RECONSTRUCT_ONLY, self.EXTRA_SHARES]})
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        error = self.assert_code(
+            "policy_denied", self.reconstruct, issued, ["alice", "bob", "carol"], "reconstruct-1"
+        )
+        self.assertEqual(409, error.status)
+        # Approvals are not consumed and no idempotency response is stored.
+        self.assertEqual(2, self.service.get_secret("prod-db-root")["approvals"]["recorded"])
+        self.assert_code(
+            "policy_denied", self.reconstruct, issued, ["alice", "bob", "carol"], "reconstruct-1"
+        )
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        denied = [event for event in run["events"] if event["type"] == "authorization_denied"]
+        self.assertEqual(2, len(denied))
+        self.assertEqual(
+            {"action": "reconstruct", "version": 1, "presented_shares": 3, "approvals": 2},
+            denied[0]["payload"],
+        )
+        # Presenting a fourth share satisfies the policy with the same key.
+        issued["dave"] = self.service.distribute_share("prod-db-root", {"holder": "dave"}, "share-dave")["share"]
+        result = self.reconstruct(issued, ["alice", "bob", "carol", "dave"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+        self.assertEqual(0, self.service.get_secret("prod-db-root")["approvals"]["recorded"])
+
+    def test_policy_facts_are_evaluated_with_pre_execution_values(self):
+        policy = {
+            "all": [
+                {"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}},
+                {"fact": {"fact": "version", "op": "eq", "value": 1}},
+                {"fact": {"fact": "threshold", "op": "eq", "value": 3}},
+                {"fact": {"fact": "approvals", "op": "gte", "value": 2}},
+                {"fact": {"fact": "presented_shares", "op": "lte", "value": 3}},
+            ]
+        }
+        self.create(policy=policy)
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.assertEqual(SECRET, self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")["secret"])
+
+    def test_rotation_policy_gate_uses_zero_presented_shares(self):
+        policy = {"any": [
+            {"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}},
+            {"fact": {"fact": "presented_shares", "op": "ne", "value": 0}},
+        ]}
+        self.create(policy=policy)
+        self.approve(["alice", "bob"])
+        error = self.assert_code("policy_denied", self.service.rotate, "prod-db-root", {}, "rotate-1")
+        self.assertEqual(409, error.status)
+        # Nothing moved: no consumption, no new version, no invalidation.
+        record = self.service.get_secret("prod-db-root")
+        self.assertEqual((1, 2), (record["version"], record["approvals"]["recorded"]))
+        denied = [e for e in self.service.audit("prod-db-root")["events"] if e["type"] == "authorization_denied"]
+        self.assertEqual(
+            [{"action": "rotate", "version": 1, "presented_shares": 0, "approvals": 2}],
+            [event["payload"] for event in denied],
+        )
+
+    def test_rotation_updates_clears_and_preserves_the_policy(self):
+        always = {"fact": {"fact": "presented_shares", "op": "gte", "value": 0}}
+        self.create(policy=always)
+        self.approve(["alice", "bob"])
+        # Omitting policy preserves it.
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        self.assertEqual({"policy": always}, self.service.get_policy("prod-db-root"))
+        # A new policy replaces it.
+        replacement = {"fact": {"fact": "version", "op": "gte", "value": 1}}
+        self.approve(["alice", "bob"], key_prefix="v2")
+        self.service.rotate("prod-db-root", {"policy": replacement}, "rotate-2")
+        self.assertEqual({"policy": replacement}, self.service.get_policy("prod-db-root"))
+        # An explicit null clears it.
+        self.approve(["alice", "bob"], key_prefix="v3")
+        self.service.rotate("prod-db-root", {"policy": None}, "rotate-3")
+        self.assertEqual({"policy": None}, self.service.get_policy("prod-db-root"))
+        # With no policy, rotation is back to the legacy behaviour.
+        self.approve(["alice", "bob"], key_prefix="v4")
+        record = self.service.rotate("prod-db-root", {}, "rotate-4")
+        self.assertEqual(5, record["version"])
+
+    def test_policy_applies_to_the_action_not_the_new_policy_being_set(self):
+        # The current policy forbids rotation; installing a permissive policy
+        # in the same request is still denied.
+        self.create(policy={"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}})
+        self.approve(["alice", "bob"])
+        self.assert_code(
+            "policy_denied", self.service.rotate, "prod-db-root", {"policy": None}, "rotate-1"
+        )
+        self.assertEqual(
+            {"policy": {"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}}},
+            self.service.get_policy("prod-db-root"),
+        )
+
+    def test_policy_denied_is_not_audited_as_reconstruction_failed(self):
+        self.create(policy={"fact": {"fact": "action", "op": "eq", "value": "rotate"}})
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.assert_code("policy_denied", self.reconstruct, issued, ["alice", "bob", "carol"], "reconstruct-1")
+        types = [event["type"] for event in self.service.audit("prod-db-root")["events"]]
+        self.assertIn("authorization_denied", types)
+        self.assertNotIn("reconstruction_failed", types)
+
+    # -------------------------------------------------------------- backup v2
+    def test_backup_carries_the_authorization_policy(self):
+        policy = {"any": [self.RECONSTRUCT_ONLY, self.EXTRA_SHARES]}
+        self.create(policy=policy)
+        backup = self.service.export_backup("prod-db-root")
+        self.assertEqual("thresholdsafe-backup-v2", backup["backup_version"])
+        self.assertEqual(policy, backup["authorization_policy"])
+        self.assertNotIn("policy", backup["secret"])
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
+    def test_verify_still_accepts_v1_backups(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        v1 = {key: value for key, value in backup.items() if key != "authorization_policy"}
+        v1["backup_version"] = "thresholdsafe-backup-v1"
+        v1["checksum"] = hashlib.sha256(
+            json.dumps({k: v for k, v in v1.items() if k != "checksum"},
+                       ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        self.assertTrue(self.service.verify_backup({"backup": v1})["valid"])
+        # A v1 document must not carry the v2 field.
+        v1["authorization_policy"] = None
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": v1})
+
+    def test_verify_v2_rejects_bad_policy_and_checksum(self):
+        self.create(policy=self.RECONSTRUCT_ONLY)
+        backup = self.service.export_backup("prod-db-root")
+        broken = copy.deepcopy(backup)
+        broken["authorization_policy"] = {"fact": {"fact": "action", "op": "eq", "value": "delete"}}
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": broken})
+        broken = copy.deepcopy(backup)
+        broken["authorization_policy"] = None
         self.assert_code("backup_integrity", self.service.verify_backup, {"backup": broken})
 
     # -------------------------------------------------------------- request shapes

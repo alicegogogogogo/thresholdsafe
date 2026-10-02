@@ -2,12 +2,17 @@
 
 A backup exported by ``ThresholdSafe.export_backup`` carries everything needed
 to reconstruct the custody state of one secret — the secret record (without
-the plaintext secret), every share of every version, all approvals and the
-full audit stream — plus a SHA-256 checksum over the remaining top-level
-values. ``verify`` re-checks such a document without touching any service
-state: structural problems raise :class:`ValidationError`, while a
-well-formed document whose contents are inconsistent raises
-:class:`BackupIntegrity`.
+the plaintext secret), the persistent authorization policy, every share of
+every version, all approvals and the full audit stream — plus a SHA-256
+checksum over the remaining top-level values. ``verify`` re-checks such a
+document without touching any service state: structural problems raise
+:class:`ValidationError`, while a well-formed document whose contents are
+inconsistent raises :class:`BackupIntegrity`.
+
+Two formats are accepted. ``thresholdsafe-backup-v1`` is the original layout
+and is verified unchanged. ``thresholdsafe-backup-v2`` — what new exports
+produce — adds the top-level ``authorization_policy`` field (a policy
+expression or ``null``), which is covered by the checksum.
 """
 
 from __future__ import annotations
@@ -19,8 +24,11 @@ from typing import Any
 
 from .errors import BackupIntegrity, ValidationError
 from .model import identifier, positive_int
+from .policy import parse_policy
 
-BACKUP_VERSION = "thresholdsafe-backup-v1"
+BACKUP_VERSION_V1 = "thresholdsafe-backup-v1"
+BACKUP_VERSION_V2 = "thresholdsafe-backup-v2"
+BACKUP_VERSION = BACKUP_VERSION_V2
 ZERO_HASH = "0" * 64
 HEX_HASH = re.compile(r"^[0-9a-f]{64}$")
 SHARE_VALUE = re.compile(r"^[0-9a-f]{1,132}$")
@@ -34,6 +42,7 @@ TOP_LEVEL_FIELDS = {
     "audit_events",
     "checksum",
 }
+TOP_LEVEL_FIELDS_V2 = TOP_LEVEL_FIELDS | {"authorization_policy"}
 SECRET_FIELDS = {
     "id",
     "name",
@@ -187,11 +196,20 @@ def _parse_event(raw: Any) -> dict[str, Any]:
 
 
 def _parse(backup: Any) -> dict[str, Any]:
-    document = _require_object(backup, TOP_LEVEL_FIELDS, "backup")
-    if document["backup_version"] != BACKUP_VERSION:
-        raise ValidationError(f"backup_version must be {BACKUP_VERSION}")
+    if not isinstance(backup, dict):
+        raise ValidationError("backup must be an object")
+    version = backup.get("backup_version")
+    if version == BACKUP_VERSION_V1:
+        fields = TOP_LEVEL_FIELDS
+    elif version == BACKUP_VERSION_V2:
+        fields = TOP_LEVEL_FIELDS_V2
+    else:
+        raise ValidationError(f"backup_version must be {BACKUP_VERSION_V1} or {BACKUP_VERSION_V2}")
+    document = _require_object(backup, fields, "backup")
     _non_empty_text(document["generated_at"], "generated_at")
     _hash_text(document["checksum"], "checksum")
+    if version == BACKUP_VERSION_V2 and document["authorization_policy"] is not None:
+        parse_policy(document["authorization_policy"])
     shares = document["shares"]
     if not isinstance(shares, list):
         raise ValidationError("shares must be an array")

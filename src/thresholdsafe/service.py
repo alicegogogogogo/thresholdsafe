@@ -20,6 +20,7 @@ from .errors import (
     InsufficientShares,
     IntegrityFailure,
     NotFoundError,
+    PolicyDenied,
     SecretFrozen,
     SecretNotFrozen,
     ShareAlreadyDistributed,
@@ -30,6 +31,7 @@ from .errors import (
     ValidationError,
 )
 from .model import (
+    UNSET,
     RotationSpec,
     SecretSpec,
     ShareClaim,
@@ -38,6 +40,7 @@ from .model import (
     resolve_policy,
     single_field,
 )
+from .policy import evaluate as evaluate_policy
 from .shamir import RandomSource, SeededRandomSource, SystemRandomSource
 from .store import Store
 
@@ -84,6 +87,7 @@ class ThresholdSafe:
                 "approvals_required": spec.approvals_required,
                 "secret_digest": _secret_digest(spec.secret),
                 "secret_length": len(spec.secret),
+                "policy": spec.policy,
                 "status": "active",
                 "status_reason": None,
                 "status_changed_at": now,
@@ -117,6 +121,15 @@ class ThresholdSafe:
 
     def get_secret(self, secret_id: str) -> dict[str, Any]:
         return self._record(secret_id)
+
+    def get_policy(self, secret_id: str) -> dict[str, Any]:
+        """Return the persistent authorization policy of one secret.
+
+        Read-only: a frozen secret answers exactly like an active one, and no
+        audit event or idempotency record is written. Secrets without a policy
+        respond with ``{"policy": None}``.
+        """
+        return {"policy": self._document(secret_id).get("policy")}
 
     # ------------------------------------------------------- freeze / unfreeze
     def freeze_secret(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
@@ -324,6 +337,7 @@ class ThresholdSafe:
             raise InsufficientApprovals(
                 f"reconstruction requires {required} approvals for version {version} but {recorded} were recorded"
             )
+        self._authorize(secret_id, document, "reconstruct", version, recorded, len(points))
         try:
             secret = shamir.combine(points).to_bytes(document["secret_length"], "big")
         except OverflowError as error:
@@ -371,6 +385,7 @@ class ThresholdSafe:
                 spec.approvals_required if spec.approvals_required is not None else document["approvals_required"]
             )
             resolve_policy(threshold, holders, approvals_required)
+            self._authorize(secret_id, document, "rotate", previous, recorded, 0)
             secret = spec.secret if spec.secret is not None else self._recover(secret_id, document)
             now = self.store.now()
             self._consume_approvals(secret_id, previous, now, recorded, "rotate")
@@ -389,6 +404,8 @@ class ThresholdSafe:
                 "secret_length": len(secret),
                 "updated_at": now,
             })
+            if spec.policy is not UNSET:
+                document["policy"] = spec.policy
             self.store.connection.execute(
                 "UPDATE secrets SET document = ?, updated_at = ? WHERE id = ?",
                 (self.store.encode(document), now, secret_id),
@@ -436,7 +453,8 @@ class ThresholdSafe:
         return _stamp({
             "backup_version": BACKUP_VERSION,
             "generated_at": self.store.now(),
-            "secret": document,
+            "authorization_policy": document.get("policy"),
+            "secret": {key: value for key, value in document.items() if key != "policy"},
             "shares": [dict(row) for row in shares],
             "approvals": [dict(row) for row in approvals],
             "audit_events": [
@@ -557,6 +575,44 @@ class ThresholdSafe:
         ).fetchone()
         return int(row["total"])
 
+    def _authorize(
+        self,
+        secret_id: str,
+        document: dict[str, Any],
+        action: str,
+        version: int,
+        approvals: int,
+        presented_shares: int,
+    ) -> None:
+        """Evaluate the persistent authorization policy, if one is attached.
+
+        Runs only after the request, status, share and approval checks have
+        passed. A denial is a custody decision: it is appended to the audit
+        chain as ``authorization_denied`` and raised as ``policy_denied``, but
+        consumes no approvals, moves no shares and stores no idempotency
+        record. Facts are the pre-execution values; ``presented_shares`` is
+        the number of distinct shares that passed validation (0 for rotation).
+        """
+        policy = document.get("policy")
+        if policy is None:
+            return
+        facts = {
+            "action": action,
+            "version": version,
+            "threshold": document["threshold"],
+            "approvals": approvals,
+            "presented_shares": presented_shares,
+        }
+        if evaluate_policy(policy, facts):
+            return
+        self._append(secret_id, "authorization_denied", {
+            "action": action,
+            "version": version,
+            "presented_shares": presented_shares,
+            "approvals": approvals,
+        })
+        raise PolicyDenied(f"the authorization policy of secret {secret_id} denies {action}")
+
     def _consume_approvals(self, secret_id: str, version: int, now: str, recorded: int, reason: str) -> None:
         self.store.connection.execute(
             "UPDATE approvals SET consumed_at = ? WHERE secret_id = ? AND version = ? AND consumed_at IS NULL",
@@ -599,7 +655,7 @@ class ThresholdSafe:
         blocked: tuple[str, str] | None = None,
     ) -> dict[str, Any]:
         self._require_key(key)
-        frozen_error: SecretFrozen | None = None
+        rejection: SecretFrozen | PolicyDenied | None = None
         with self.store.transaction() as connection:
             operation_name = operation() if callable(operation) else operation
             existing = connection.execute(
@@ -615,19 +671,24 @@ class ThresholdSafe:
                 # The guard is the first thing the action checks, so nothing was
                 # mutated. Commit (at most) the operation_blocked event, store no
                 # idempotency record, and surface the rejection after commit.
-                frozen_error = error
+                rejection = error
                 if blocked is not None:
                     secret_id, operation_name_recorded = blocked
                     self._append(secret_id, "operation_blocked",
                                  {"operation": operation_name_recorded, "code": error.code})
+            except PolicyDenied as error:
+                # The action already appended its authorization_denied event;
+                # commit that event but store no idempotency record, so a
+                # retry with the same key re-evaluates the policy.
+                rejection = error
             else:
                 connection.execute(
                     "INSERT INTO idempotency(key, operation, response) VALUES (?, ?, ?)",
                     (key, operation_name, self.store.encode(response)),
                 )
                 return response
-        assert frozen_error is not None
-        raise frozen_error
+        assert rejection is not None
+        raise rejection
 
     @staticmethod
     def _require_key(key: str | None) -> None:

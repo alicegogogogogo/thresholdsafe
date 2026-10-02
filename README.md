@@ -32,6 +32,9 @@ The initial release supports a compact public contract:
 - a secret can be emergency-frozen: while `frozen`, share distribution,
   approvals, reconstruction and rotation all return `409 secret_frozen`, and
   unfreezing leaves the current version, shares and approvals untouched;
+- a secret can carry a persistent authorization policy — a strict JSON
+  expression over the facts of an attempted action — that gates
+  reconstruction and rotation beyond the fixed approval requirement;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
 - a secret can be exported as a self-contained, checksummed JSON backup, and
@@ -94,7 +97,9 @@ description of at most 200 characters; `threshold` is an integer `>= 2` and
 identifiers; `approvals_required` is an integer `>= 1` and `<=` the number of
 holders; `secret` is a non-empty string encoding to at most 64 UTF-8 bytes
 (the sharing field is `2**521 - 1`); the optional `seed` is an integer in
-`[0, 2**63]` that makes share issuance reproducible (see Determinism).
+`[0, 2**63]` that makes share issuance reproducible (see Determinism); the
+optional `policy` is an authorization-policy expression (see Authorization
+policy) that gates later reconstructions and rotations.
 
 Returns HTTP 201 with the custody record, which never contains share material
 or the secret itself:
@@ -184,6 +189,54 @@ replays the stored success response; using the key for anything else,
 including the opposite transition or a later freeze cycle after an unfreeze,
 is `409 conflict`.
 
+### Authorization policy
+
+```http
+GET /secrets/prod-db-root/policy
+```
+
+A secret can carry a persistent authorization policy, set at creation with
+the optional `policy` field and changed by rotation (`policy` in the rotation
+body replaces it, `null` clears it, and omitting the field preserves it).
+This endpoint returns the current expression:
+
+```json
+{"policy":{"all":[{"fact":{"fact":"action","op":"eq","value":"reconstruct"}},{"fact":{"fact":"presented_shares","op":"gte","value":4}}]}}
+```
+
+or `{"policy":null}` when none is attached. Reading the policy is read-only:
+it works while the secret is frozen, and no audit event or idempotency
+record is written. Unknown secrets return 404.
+
+A policy is a strict JSON expression. Every node is an object with exactly
+one of these fields:
+
+- `all`: a non-empty array of child nodes; holds when every child holds;
+- `any`: a non-empty array of child nodes; holds when any child holds;
+- `not`: a single child node; holds when the child does not;
+- `fact`: an object with exactly `fact`, `op` and `value`, comparing one
+  fact of the attempted action.
+
+The facts are `action` (`"reconstruct"` or `"rotate"`, comparable only with
+`eq`/`ne`) and the non-negative integers `version`, `threshold`, `approvals`
+and `presented_shares` (comparable with `eq`, `ne`, `gte`, `lte`). All facts
+take their pre-execution values; `presented_shares` is the number of
+distinct submitted shares that passed the version, distribution and
+commitment checks (always `0` for rotation). Unknown fields, empty `all`/
+`any` arrays, and illegal facts, ops or value types are
+`400 validation_error` wherever a policy is accepted (creation, rotation,
+v2 backups).
+
+The policy is evaluated only after the request shape, status, share and
+approval checks have all passed. When it holds, the action proceeds exactly
+as before. When it does not, the action fails with `409 policy_denied`: the
+secret is not returned, no approvals are consumed, no shares are distributed
+or invalidated, and no idempotency response is stored (a retry with the same
+key re-evaluates the policy). The denial is appended to the audit stream as
+an `authorization_denied` event whose payload carries `action`, `version`,
+`presented_shares` and `approvals`. Secrets without a policy behave exactly
+as before this feature existed.
+
 ### Distribute a share
 
 ```http
@@ -265,7 +318,9 @@ this order and the first failure is returned:
 9. at least `threshold` shares were submitted (409 `insufficient_shares`);
 10. at least `approvals_required` approvals exist for the version
     (409 `insufficient_approvals`);
-11. the recovered integer matches the stored commitment and byte length
+11. the persistent authorization policy, when one is attached, holds for
+    this attempt (409 `policy_denied`);
+12. the recovered integer matches the stored commitment and byte length
     (409 `integrity_failure`).
 
 More than `threshold` shares is allowed; extras only add redundancy. Shares
@@ -299,9 +354,13 @@ Content-Type: application/json
 ```
 
 Every field is optional; omitted fields keep their current value, and `{}`
-re-issues shares for the same secret value. Rotation must satisfy the
-approvals currently required for the version it replaces, and those approvals
-are consumed. Returns HTTP 200 with the new custody record:
+re-issues shares for the same secret value. `policy` follows the same rule
+with one extension: an explicit `"policy": null` clears the authorization
+policy, while omitting the field preserves it. Rotation must satisfy the
+approvals currently required for the version it replaces, and those
+approvals are consumed; the currently stored authorization policy (not the
+one being installed) must also permit the rotation. Returns HTTP 200 with
+the new custody record:
 
 ```json
 {"id":"prod-db-root","name":"Production database root key","version":2,"threshold":2,"holders":["frank","grace","heidi"],"approvals_required":2,"share_count":3,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":16,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:54:08.150075Z","created_at":"2026-10-02T05:54:08.150075Z","updated_at":"2026-10-02T05:54:08.384263Z"}
@@ -330,8 +389,8 @@ its integrity:
 
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
 `approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
-`secret_frozen`, `secret_unfrozen`, `operation_blocked` and
-`reconstruction_failed`. Sequences start at 1 and have no gaps. Each event
+`secret_frozen`, `secret_unfrozen`, `operation_blocked`,
+`authorization_denied` and `reconstruction_failed`. Sequences start at 1 and have no gaps. Each event
 carries `previous_hash` and
 `hash = sha256("<previous_hash>|<sequence>|<type>|<canonical payload>|<occurred_at>")`,
 where the canonical payload is the JSON text with sorted keys and compact
@@ -340,7 +399,9 @@ an edited event is detectable. A failed reconstruction is recorded when the
 failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 `stale_share`, `share_not_distributed`, `share_mismatch`,
 `integrity_failure`); malformed bodies are not audited. A custody write
-rejected because the secret is frozen is recorded as `operation_blocked`.
+rejected because the secret is frozen is recorded as `operation_blocked`; a
+reconstruction or rotation rejected by the persistent authorization policy
+is recorded as `authorization_denied`.
 
 ### Export a backup
 
@@ -354,8 +415,10 @@ custody and independent verification. Exporting is read-only: it needs no
 frozen. Unknown secrets return 404 `not_found`.
 
 The top level carries exactly `backup_version` (always
-`thresholdsafe-backup-v1`), `generated_at` (the usual UTC timestamp),
-`secret`, `shares`, `approvals`, `audit_events` and `checksum`. `secret` is
+`thresholdsafe-backup-v2` for new exports), `generated_at` (the usual UTC
+timestamp), `authorization_policy` (the persistent authorization policy
+expression, or `null`), `secret`, `shares`, `approvals`, `audit_events` and
+`checksum`. `secret` is
 the stored record — including `secret_length` and `secret_digest`, never the
 plaintext. `shares` covers every version, each entry keeping `share_id`,
 `secret_id`, `version`, `holder`, `coordinate`, `value`, `commitment`,
@@ -382,8 +445,12 @@ Independently verifies a backup document. The body must contain exactly
 `backup`; no `Idempotency-Key` is required, and the service neither reads nor
 modifies any state — nothing is audited and no idempotency record is stored.
 A malformed document (missing, extra or wrongly typed fields, an unsupported
-`backup_version`) is `400 validation_error`. A well-formed document whose
-checksum does not match, or whose secret ownership, version continuity,
+`backup_version`, or a syntactically invalid `authorization_policy` in a v2
+document) is `400 validation_error`. Both `thresholdsafe-backup-v1` (the
+original layout, without `authorization_policy`) and
+`thresholdsafe-backup-v2` documents are accepted. A well-formed document
+whose checksum does not match, or whose secret ownership, version
+continuity,
 `share_id` ownership, share value/commitment pairs, approver ownership or
 audit ordering and chain hashes are inconsistent, is `409 backup_integrity`;
 verification never partially accepts. A valid backup returns HTTP 200:
@@ -396,7 +463,7 @@ verification never partially accepts. A valid backup returns HTTP 200:
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, status (`active`/`frozen`), status reason and change timestamp, timestamps |
+| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, authorization policy, status (`active`/`frozen`), status reason and change timestamp, timestamps |
 | `shares` | `share_id` | secret, version, holder, coordinate `x`, value `f(x)`, commitment, `distributed_at`, `invalidated_at` |
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
@@ -407,7 +474,8 @@ unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
 request leaves no partial state and every request observes a complete
 pre- or post-transition snapshot. A write rejected because the secret is
 frozen commits in that same transaction only its `operation_blocked` event,
-with no idempotency record. The single case with a separate transaction is a
+with no idempotency record; a policy denial likewise commits only its
+`authorization_denied` event. The single case with a separate transaction is a
 rejected reconstruction, whose audit event is committed on its own after the
 attempt rolls back.
 
@@ -442,6 +510,7 @@ Errors use this shape:
 | `share_already_distributed` | 409 | that holder already received the share for this version |
 | `duplicate_approval` | 409 | that approver already approved this version |
 | `integrity_failure` | 409 | the recovered value does not match the stored commitment |
+| `policy_denied` | 409 | the persistent authorization policy denies the attempted reconstruction or rotation |
 | `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
 | `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
 | `backup_integrity` | 409 | a structurally valid backup fails checksum or internal consistency checks |
