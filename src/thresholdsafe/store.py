@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS idempotency (
   operation TEXT NOT NULL,
   response TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS receipt_keys (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  algorithm TEXT NOT NULL,
+  private_key TEXT NOT NULL,
+  public_key TEXT NOT NULL,
+  key_id TEXT NOT NULL,
+  created_at TEXT NOT NULL
+);
 """
 
 

@@ -4,7 +4,7 @@ import hashlib
 import sqlite3
 from typing import Any, Callable
 
-from . import shamir
+from . import receipts, shamir
 from .backup import (
     BACKUP_VERSION,
     ZERO_HASH,
@@ -14,6 +14,7 @@ from .backup import (
     verify as _verify,
 )
 from .errors import (
+    AuditIntegrity,
     ConflictError,
     DuplicateApproval,
     InsufficientApprovals,
@@ -70,6 +71,28 @@ class ThresholdSafe:
     def __init__(self, database: str, source: RandomSource | None = None):
         self.store = Store(database)
         self.source: RandomSource = source if source is not None else SystemRandomSource()
+        self._receipt_key = self._load_receipt_key()
+
+    def _load_receipt_key(self) -> receipts.ReceiptKey:
+        """The receipt-signing key of this database, created on first use.
+
+        Runs inside one ``BEGIN IMMEDIATE`` transaction, so concurrent
+        processes opening the same database — old or new — converge on a
+        single persisted key. The private half never leaves the database.
+        """
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT private_key FROM receipt_keys WHERE id = 1"
+            ).fetchone()
+            if row is not None:
+                return receipts.ReceiptKey.load(row["private_key"])
+            key = receipts.ReceiptKey.generate()
+            connection.execute(
+                "INSERT INTO receipt_keys(id, algorithm, private_key, public_key, key_id, created_at) "
+                "VALUES (1, ?, ?, ?, ?, ?)",
+                (receipts.ALGORITHM, key.private_key, key.public_key, key.key_id, self.store.now()),
+            )
+            return key
 
     # ------------------------------------------------------------------ create
     def create_secret(self, raw: Any, key: str | None) -> dict[str, Any]:
@@ -536,6 +559,17 @@ class ThresholdSafe:
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
         document = self._document(secret_id)
+        events, chain_valid = self._audit_events(secret_id)
+        return {
+            "secret_id": secret_id,
+            "version": document["version"],
+            "chain_valid": chain_valid,
+            "head_hash": events[-1]["hash"] if events else ZERO_HASH,
+            "events": events,
+        }
+
+    def _audit_events(self, secret_id: str) -> tuple[list[dict[str, Any]], bool]:
+        """The decoded event stream of one secret plus its chain verdict."""
         rows = self.store.connection.execute(
             "SELECT sequence, type, payload, occurred_at, previous_hash, hash FROM audit_events "
             "WHERE secret_id = ? ORDER BY sequence",
@@ -557,13 +591,67 @@ class ThresholdSafe:
             if row["previous_hash"] != previous or row["hash"] != expected:
                 chain_valid = False
             previous = row["hash"]
+        return events, chain_valid
+
+    # ----------------------------------------------------------------- receipts
+    def receipt_key(self) -> dict[str, Any]:
+        """The public half of the receipt-signing key.
+
+        Read-only: no audit event or idempotency record is written, and the
+        private half never appears here (or anywhere else outside the
+        database).
+        """
         return {
-            "secret_id": secret_id,
-            "version": document["version"],
-            "chain_valid": chain_valid,
-            "head_hash": previous,
-            "events": events,
+            "algorithm": receipts.ALGORITHM,
+            "key_id": self._receipt_key.key_id,
+            "public_key": self._receipt_key.public_key,
         }
+
+    def issue_receipt(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Sign a receipt certifying one audit event of one secret.
+
+        The whole chain is re-verified first: a broken chain is
+        ``409 audit_integrity``. The issuance itself is appended to the
+        chain as ``audit_receipt_issued`` in the same transaction, and the
+        receipt's head points at that event. A frozen secret is served
+        exactly like an active one; failures write nothing.
+        """
+        self._require_key(key)
+        sequence, nonce = receipts.parse_request(raw)
+        operation = "audit-receipt:" + self.store.encode([secret_id, sequence, nonce])
+
+        def issue() -> dict[str, Any]:
+            self._document(secret_id)
+            events, chain_valid = self._audit_events(secret_id)
+            if not chain_valid:
+                raise AuditIntegrity(f"the audit chain of secret {secret_id} is broken")
+            target = next((event for event in events if event["sequence"] == sequence), None)
+            if target is None:
+                raise NotFoundError(f"event {sequence} was not found for secret {secret_id}")
+            head = self._append(secret_id, "audit_receipt_issued", {
+                "key_id": self._receipt_key.key_id,
+                "nonce": nonce,
+                "target_sequence": sequence,
+            })
+            receipt = {
+                "algorithm": receipts.ALGORITHM,
+                "key_id": self._receipt_key.key_id,
+                "secret_id": secret_id,
+                "event": target,
+                "nonce": nonce,
+                "head_sequence": head["sequence"],
+                "head_hash": head["hash"],
+            }
+            receipt["signature"] = self._receipt_key.sign(receipts.signing_payload(receipt))
+            return receipt
+
+        return self._idempotent(key, operation, issue)
+
+    def verify_receipt(self, raw: Any) -> dict[str, Any]:
+        """Independently verify an audit receipt without touching service state."""
+        if not isinstance(raw, dict) or set(raw) != {"receipt", "public_key"}:
+            raise ValidationError("receipt verification body must contain exactly receipt and public_key")
+        return receipts.verify(raw["receipt"], raw["public_key"])
 
     # ------------------------------------------------------------------ helpers
     @staticmethod
@@ -722,7 +810,7 @@ class ThresholdSafe:
                 "message": str(error),
             })
 
-    def _append(self, secret_id: str, event_type: str, payload: dict[str, Any]) -> None:
+    def _append(self, secret_id: str, event_type: str, payload: dict[str, Any]) -> dict[str, Any]:
         row = self.store.connection.execute(
             "SELECT hash FROM audit_events WHERE secret_id = ? ORDER BY sequence DESC LIMIT 1", (secret_id,)
         ).fetchone()
@@ -732,12 +820,20 @@ class ThresholdSafe:
         ).fetchone()["sequence"]
         occurred_at = self.store.now()
         encoded = self.store.encode(payload)
+        event_hash = _event_hash(previous, sequence, event_type, encoded, occurred_at)
         self.store.connection.execute(
             "INSERT INTO audit_events(secret_id, sequence, type, payload, occurred_at, previous_hash, hash) "
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (secret_id, sequence, event_type, encoded, occurred_at, previous,
-             _event_hash(previous, sequence, event_type, encoded, occurred_at)),
+            (secret_id, sequence, event_type, encoded, occurred_at, previous, event_hash),
         )
+        return {
+            "sequence": sequence,
+            "type": event_type,
+            "payload": payload,
+            "occurred_at": occurred_at,
+            "previous_hash": previous,
+            "hash": event_hash,
+        }
 
     def _idempotent(
         self,

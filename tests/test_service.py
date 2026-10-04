@@ -1,3 +1,4 @@
+import base64
 import copy
 import hashlib
 import json
@@ -5,6 +6,10 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+from thresholdsafe import receipts
 from thresholdsafe.errors import SecretFrozen, SecretNotFrozen, ThresholdSafeError
 from thresholdsafe.service import ThresholdSafe
 
@@ -1275,6 +1280,257 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assert_code("not_found", self.service.reconstruct, "missing", claim, "k2")
         self.assert_code("not_found", self.service.rotate, "missing", {}, "k3")
         self.assert_code("not_found", self.service.record_approval, "missing", {"approver": "alice"}, "k4")
+
+    # ------------------------------------------------------------------ receipts
+    @staticmethod
+    def decode_key(public_key):
+        return Ed25519PublicKey.from_public_bytes(receipts.b64decode(public_key, "public_key", 32))
+
+    def issue(self, sequence=1, nonce="nonce-1", key="receipt-1", secret_id="prod-db-root"):
+        return self.service.issue_receipt(secret_id, {"sequence": sequence, "nonce": nonce}, key)
+
+    def test_receipt_key_is_public_stable_and_shared_across_instances(self):
+        key = self.service.receipt_key()
+        self.assertEqual({"algorithm", "key_id", "public_key"}, set(key))
+        self.assertEqual("Ed25519", key["algorithm"])
+        raw = receipts.b64decode(key["public_key"], "public_key", 32)
+        self.assertEqual(hashlib.sha256(raw).hexdigest(), key["key_id"])
+        self.assertNotIn("private", json.dumps(key).lower())
+        # A second instance opening the same database serves the same key.
+        self.assertEqual(key, ThresholdSafe(self.database).receipt_key())
+        # Reading the key writes nothing.
+        self.create()
+        events = self.service.audit("prod-db-root")["events"]
+        self.service.receipt_key()
+        self.assertEqual(events, self.service.audit("prod-db-root")["events"])
+
+    def test_receipt_key_survives_in_an_old_database(self):
+        # A database file created before receipt keys existed gains the key
+        # table and one persisted key when the new code opens it.
+        self.create()
+        self.service.store.connection.execute("DROP TABLE receipt_keys")
+        migrated = ThresholdSafe(self.database)
+        key = migrated.receipt_key()
+        self.assertEqual(key, ThresholdSafe(self.database).receipt_key())
+
+    def test_issued_receipt_verifies_independently(self):
+        self.create()
+        self.distribute(["alice"])
+        receipt = self.issue(sequence=2, nonce="order-4711")
+        self.assertEqual(
+            {"algorithm", "key_id", "secret_id", "event", "nonce",
+             "head_sequence", "head_hash", "signature"},
+            set(receipt),
+        )
+        self.assertEqual("Ed25519", receipt["algorithm"])
+        self.assertEqual("prod-db-root", receipt["secret_id"])
+        self.assertEqual("order-4711", receipt["nonce"])
+        self.assertEqual(2, receipt["event"]["sequence"])
+        self.assertEqual("share_distributed", receipt["event"]["type"])
+        # The head points at the audit_receipt_issued event this call appended.
+        run = self.service.audit("prod-db-root")
+        issued = run["events"][-1]
+        self.assertEqual("audit_receipt_issued", issued["type"])
+        self.assertEqual(
+            {"key_id": receipt["key_id"], "nonce": "order-4711", "target_sequence": 2},
+            issued["payload"],
+        )
+        self.assertEqual(issued["sequence"], receipt["head_sequence"])
+        self.assertEqual(issued["hash"], receipt["head_hash"])
+        self.assertEqual(run["head_hash"], receipt["head_hash"])
+        # The signature verifies against the published public key, over the
+        # canonical JSON of every field but the signature.
+        signature = receipts.b64decode(receipt["signature"], "signature", 64)
+        self.decode_key(self.service.receipt_key()["public_key"]).verify(
+            signature, receipts.signing_payload(receipt)
+        )
+        # ... and through the stateless verification endpoint.
+        self.assertEqual(
+            {"valid": True},
+            self.service.verify_receipt(
+                {"receipt": receipt, "public_key": self.service.receipt_key()["public_key"]}
+            ),
+        )
+
+    def test_receipt_issuance_is_idempotent_and_conflict_scoped(self):
+        self.create()
+        first = self.issue()
+        self.assertEqual(first, self.issue())
+        issued = [e for e in self.service.audit("prod-db-root")["events"]
+                  if e["type"] == "audit_receipt_issued"]
+        self.assertEqual(1, len(issued))
+        self.assert_code("conflict", self.issue, 1, "other-nonce")
+        self.assert_code("conflict", self.issue, 2, "nonce-1")
+        self.assert_code("conflict", self.service.issue_receipt,
+                         "other-secret", {"sequence": 1, "nonce": "nonce-1"}, "receipt-1")
+        self.assertEqual(1, len([e for e in self.service.audit("prod-db-root")["events"]
+                                 if e["type"] == "audit_receipt_issued"]))
+
+    def test_receipt_issuance_validation(self):
+        self.create()
+        self.assert_code("validation_error", self.service.issue_receipt,
+                         "prod-db-root", {"sequence": 1, "nonce": "n"}, None)
+        for body in [
+            {"sequence": 1},
+            {"nonce": "n"},
+            {"sequence": 1, "nonce": "n", "extra": True},
+            {"sequence": 0, "nonce": "n"},
+            {"sequence": True, "nonce": "n"},
+            {"sequence": "1", "nonce": "n"},
+            {"sequence": 1, "nonce": ""},
+            {"sequence": 1, "nonce": 7},
+            {"sequence": 1, "nonce": "x" * 129},
+        ]:
+            self.assert_code("validation_error", self.service.issue_receipt,
+                             "prod-db-root", body, f"bad-{body!r}"[:60])
+        # A 128-byte nonce is the boundary and is kept exactly as sent.
+        nonce = "é" * 64  # 128 UTF-8 bytes
+        receipt = self.issue(nonce=nonce, key="boundary")
+        self.assertEqual(nonce, receipt["nonce"])
+        self.assert_code("validation_error", self.service.issue_receipt,
+                         "prod-db-root", {"sequence": 1, "nonce": "é" * 64 + "x"}, "too-long")
+        # Failures wrote nothing: only the boundary receipt was issued.
+        issued = [e for e in self.service.audit("prod-db-root")["events"]
+                  if e["type"] == "audit_receipt_issued"]
+        self.assertEqual(1, len(issued))
+
+    def test_receipt_issuance_not_found(self):
+        self.create()
+        self.assert_code("not_found", self.service.issue_receipt,
+                         "missing", {"sequence": 1, "nonce": "n"}, "k1")
+        self.assert_code("not_found", self.issue, 99, "n", "k2")
+
+    def test_receipt_issuance_rejects_a_broken_chain(self):
+        self.create()
+        self.service.store.connection.execute(
+            "UPDATE audit_events SET payload = ? WHERE secret_id = ? AND sequence = 1",
+            (json.dumps({"forged": True}), "prod-db-root"),
+        )
+        self.assertFalse(self.service.audit("prod-db-root")["chain_valid"])
+        self.assert_code("audit_integrity", self.issue)
+        self.assertFalse(self.service.audit("prod-db-root")["chain_valid"])
+        # The failure wrote nothing: no new event, no idempotency record.
+        self.assertEqual(1, len(self.service.audit("prod-db-root")["events"]))
+        row = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS total FROM idempotency WHERE key = 'receipt-1'"
+        ).fetchone()
+        self.assertEqual(0, row["total"])
+
+    def test_receipt_issuance_ignores_freeze(self):
+        self.create()
+        self.freeze()
+        receipt = self.issue()
+        self.assertEqual("prod-db-root", receipt["secret_id"])
+        self.assertEqual(
+            {"valid": True},
+            self.service.verify_receipt(
+                {"receipt": receipt, "public_key": self.service.receipt_key()["public_key"]}
+            ),
+        )
+
+    def test_receipt_verification_distinguishes_failure_reasons(self):
+        self.create()
+        receipt = self.issue()
+        public_key = self.service.receipt_key()["public_key"]
+
+        def verify(document, key=public_key):
+            return self.service.verify_receipt({"receipt": document, "public_key": key})
+
+        self.assertEqual({"valid": True}, verify(receipt))
+        # Content tampering is receipt_integrity.
+        tampered = copy.deepcopy(receipt)
+        tampered["event"]["payload"]["name"] = "forged"
+        self.assertEqual({"valid": False, "reason": "receipt_integrity"}, verify(tampered))
+        tampered = copy.deepcopy(receipt)
+        tampered["event"]["hash"] = "0" * 64
+        self.assertEqual({"valid": False, "reason": "receipt_integrity"}, verify(tampered))
+        tampered = copy.deepcopy(receipt)
+        tampered["head_sequence"] = receipt["event"]["sequence"]
+        self.assertEqual({"valid": False, "reason": "receipt_integrity"}, verify(tampered))
+        # A public key that does not match key_id is receipt_integrity too.
+        other = ThresholdSafe(str(Path(self.directory.name) / "other.db")).receipt_key()
+        self.assertEqual({"valid": False, "reason": "receipt_integrity"},
+                         verify(receipt, other["public_key"]))
+        # Signed-content tampering and signature corruption are signature_mismatch.
+        tampered = copy.deepcopy(receipt)
+        tampered["nonce"] = "other-nonce"
+        self.assertEqual({"valid": False, "reason": "signature_mismatch"}, verify(tampered))
+        tampered = copy.deepcopy(receipt)
+        raw = bytearray(receipts.b64decode(receipt["signature"], "signature", 64))
+        raw[0] ^= 1
+        tampered["signature"] = receipts.b64encode(bytes(raw))
+        self.assertEqual({"valid": False, "reason": "signature_mismatch"}, verify(tampered))
+
+    def test_receipt_verification_rejects_malformed_documents(self):
+        self.create()
+        receipt = self.issue()
+        public_key = self.service.receipt_key()["public_key"]
+        self.assert_code("validation_error", self.service.verify_receipt, {"receipt": receipt})
+        self.assert_code("validation_error", self.service.verify_receipt,
+                         {"receipt": receipt, "public_key": public_key, "extra": 1})
+        for document in [
+            None,
+            {k: v for k, v in receipt.items() if k != "nonce"},
+            {**receipt, "extra": 1},
+            {**receipt, "algorithm": "EdDSA"},
+            {**receipt, "key_id": "zz" * 32},
+            {**receipt, "signature": "not+url/safe=="},
+            {**receipt, "signature": receipts.b64encode(b"short")},
+            {**receipt, "event": {**receipt["event"], "hash": "zz" * 32}},
+        ]:
+            self.assert_code("validation_error", self.service.verify_receipt,
+                             {"receipt": document, "public_key": public_key})
+        self.assert_code("validation_error", self.service.verify_receipt,
+                         {"receipt": receipt, "public_key": "not+url/safe=="})
+        self.assert_code("validation_error", self.service.verify_receipt,
+                         {"receipt": receipt, "public_key": receipts.b64encode(b"short")})
+        # Verification is pure: no events, no idempotency records.
+        self.assertEqual(2, len(self.service.audit("prod-db-root")["events"]))
+        row = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS total FROM idempotency"
+        ).fetchone()
+        self.assertEqual(2, row["total"])  # create + receipt issuance only
+
+    def test_private_key_stays_out_of_responses_and_backups(self):
+        self.create()
+        self.issue()
+        stored = self.service.store.connection.execute(
+            "SELECT private_key FROM receipt_keys WHERE id = 1"
+        ).fetchone()["private_key"]
+        for document in [
+            self.service.receipt_key(),
+            self.issue(key="receipt-2"),
+            self.service.export_backup("prod-db-root"),
+            self.service.audit("prod-db-root"),
+        ]:
+            self.assertNotIn(stored, json.dumps(document))
+
+    def test_concurrent_receipt_issuance_matches_serial_execution(self):
+        import threading
+
+        self.create()
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def issue_same() -> None:
+            try:
+                results.append(self.issue())
+            except Exception as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=issue_same) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([], errors)
+        # One idempotency key, one issuance event, one identical response.
+        self.assertEqual([results[0]] * 8, results)
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        issued = [e for e in run["events"] if e["type"] == "audit_receipt_issued"]
+        self.assertEqual(1, len(issued))
+
 
 
 if __name__ == "__main__":

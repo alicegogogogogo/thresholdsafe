@@ -41,6 +41,8 @@ The initial release supports a compact public contract:
   reconstruction and rotation beyond the fixed approval requirement;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
+- any audit event can be certified by an Ed25519-signed receipt that clients
+  verify independently against the service's published public key;
 - a secret can be exported as a self-contained, checksummed JSON backup, and
   any backup document can be verified independently without touching service
   state;
@@ -50,7 +52,8 @@ The initial release supports a compact public contract:
 ## Requirements
 
 - Python 3.11 or newer
-- no third-party runtime dependencies
+- `cryptography` (for the Ed25519 audit-receipt signatures); no other
+  third-party runtime dependencies
 
 ## Run the service
 
@@ -417,7 +420,7 @@ its integrity:
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
 `approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
 `secret_frozen`, `secret_unfrozen`, `operation_blocked`,
-`authorization_denied` and `reconstruction_failed`. The `secret_created`,
+`authorization_denied`, `reconstruction_failed` and `audit_receipt_issued`. The `secret_created`,
 `approval_recorded` and `secret_rotated` payloads carry the version's role
 information (`approval_mode` and the effective `approvers` roster) alongside
 their other fields. Sequences start at 1 and have no gaps. Each event
@@ -432,6 +435,87 @@ failure is a custody decision (`insufficient_shares`, `insufficient_approvals`,
 rejected because the secret is frozen is recorded as `operation_blocked`; a
 reconstruction or rotation rejected by the persistent authorization policy
 is recorded as `authorization_denied`.
+
+### Receipt signing key
+
+```http
+GET /audit/receipt-key
+```
+
+Returns the public half of the service's Ed25519 receipt-signing key:
+
+```json
+{"algorithm":"Ed25519","key_id":"93984123e92b506065875392671400c06ec49a3d4293b8091635a9f5e8b0c83a","public_key":"PpGREZtD1Y_nXMlx6zHbVFS4dRhZeQCwDm3hjIIebFI"}
+```
+
+`key_id` is the lowercase hexadecimal SHA-256 digest of the raw public key;
+`public_key` (and every signature) is URL-safe Base64 without padding. The
+key is generated once, persisted in the database, and shared by every
+process serving that database — including databases created before receipts
+existed, which gain the key on first open. Reading the key is read-only: no
+audit event or idempotency record is written. The private key never appears
+in any response or backup.
+
+### Issue an audit receipt
+
+```http
+POST /secrets/prod-db-root/audit-receipts
+Idempotency-Key: demo-receipt
+Content-Type: application/json
+
+{"sequence": 1, "nonce": "order-4711"}
+```
+
+Signs a receipt certifying one existing audit event of one secret. The body
+must contain exactly `sequence` (a positive integer identifying an event of
+this secret) and `nonce` (a non-empty string of at most 128 UTF-8 bytes,
+kept exactly as sent). The whole audit chain is re-verified first: a broken
+chain is `409 audit_integrity`, an unknown secret or event is
+`404 not_found`, a malformed body is `400 validation_error`, and every
+failure writes nothing. A frozen secret is served exactly like an active
+one.
+
+On success the service appends an `audit_receipt_issued` event — payload
+`{"key_id", "nonce", "target_sequence"}` — in the same transaction and
+returns HTTP 201:
+
+```json
+{"algorithm":"Ed25519","key_id":"9398...b0c83a","secret_id":"prod-db-root","event":{"sequence":1,"type":"secret_created","payload":{...},"occurred_at":"2026-10-02T05:54:21.162864Z","previous_hash":"0000...0000","hash":"dbba...0c44"},"nonce":"order-4711","head_sequence":2,"head_hash":"9ad6...22d5","signature":"xvEp...5oAg"}
+```
+
+`event` is the certified event in the audit-stream shape; `head_sequence`
+and `head_hash` point at the `audit_receipt_issued` event this call
+appended, so the receipt also pins the chain head at issuance time.
+`signature` signs the UTF-8 canonical JSON (sorted keys, compact separators)
+of every other field. Repeating the same request with the same
+`Idempotency-Key` replays the stored response and appends no further event;
+reusing the key with a different secret, `sequence` or `nonce` is
+`409 conflict`. Concurrent issuances linearize exactly like a serial
+execution and produce at most one issuance event per idempotency key.
+
+### Verify an audit receipt
+
+```http
+POST /audit/receipts/verify
+Content-Type: application/json
+
+{"receipt": { ...issued receipt... }, "public_key": "PpGREZtD1Y_nXMlx6zHbVFS4dRhZeQCwDm3hjIIebFI"}
+```
+
+Independently verifies a receipt against a public key. The body must contain
+exactly `receipt` and `public_key`; no `Idempotency-Key` is required, and
+the service neither reads nor modifies any custody state. A malformed
+document (missing, extra or wrongly typed fields, bad digests or bad Base64)
+is `400 validation_error`. A well-formed document whose event hash, head
+position or public-key digest does not match answers
+`{"valid":false,"reason":"receipt_integrity"}`; a well-formed document whose
+Ed25519 signature does not verify answers
+`{"valid":false,"reason":"signature_mismatch"}`; both come with HTTP 200. A
+fully consistent receipt answers:
+
+```json
+{"valid":true}
+```
 
 ### Export a backup
 
@@ -506,6 +590,7 @@ verification never partially accepts. A valid backup returns HTTP 200:
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
 | `idempotency` | `key` | operation name, stored response |
+| `receipt_keys` | singleton row | the Ed25519 receipt-signing key (private half included — it never leaves the database), public key, `key_id`, creation timestamp |
 
 Issuance, distribution, approval, reconstruction, rotation and freeze or
 unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
@@ -552,6 +637,7 @@ Errors use this shape:
 | `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
 | `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
 | `backup_integrity` | 409 | a structurally valid backup fails checksum or internal consistency checks |
+| `audit_integrity` | 409 | a receipt was requested for a secret whose audit chain does not re-verify |
 | `internal_error` | 500 | unexpected server failure |
 
 ## Tests
