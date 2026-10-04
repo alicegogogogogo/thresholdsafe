@@ -10,9 +10,14 @@ document without touching any service state: structural problems raise
 inconsistent raises :class:`BackupIntegrity`.
 
 Two formats are accepted. ``thresholdsafe-backup-v1`` is the original layout
-and is verified unchanged. ``thresholdsafe-backup-v2`` — what new exports
-produce — adds the top-level ``authorization_policy`` field (a policy
-expression or ``null``), which is covered by the checksum.
+and is verified unchanged. ``thresholdsafe-backup-v2`` adds the top-level
+``authorization_policy`` field (a policy expression or ``null``), which is
+covered by the checksum. ``thresholdsafe-backup-v3`` — what new exports
+produce — adds ``versions``: a snapshot of the holder and approver rosters of
+every version from 1 to the current one, so the role attribution of each
+share and approval can be verified against the version it belongs to. v1 and
+v2 documents carry no role information and are read in legacy mode, where the
+approvers of a version are exactly its holders.
 """
 
 from __future__ import annotations
@@ -28,7 +33,8 @@ from .policy import parse_policy
 
 BACKUP_VERSION_V1 = "thresholdsafe-backup-v1"
 BACKUP_VERSION_V2 = "thresholdsafe-backup-v2"
-BACKUP_VERSION = BACKUP_VERSION_V2
+BACKUP_VERSION_V3 = "thresholdsafe-backup-v3"
+BACKUP_VERSION = BACKUP_VERSION_V3
 ZERO_HASH = "0" * 64
 HEX_HASH = re.compile(r"^[0-9a-f]{64}$")
 SHARE_VALUE = re.compile(r"^[0-9a-f]{1,132}$")
@@ -43,6 +49,7 @@ TOP_LEVEL_FIELDS = {
     "checksum",
 }
 TOP_LEVEL_FIELDS_V2 = TOP_LEVEL_FIELDS | {"authorization_policy"}
+TOP_LEVEL_FIELDS_V3 = TOP_LEVEL_FIELDS_V2 | {"versions"}
 SECRET_FIELDS = {
     "id",
     "name",
@@ -72,6 +79,8 @@ SHARE_FIELDS = {
 }
 APPROVAL_FIELDS = {"secret_id", "version", "approver", "created_at", "consumed_at"}
 EVENT_FIELDS = {"sequence", "type", "payload", "occurred_at", "previous_hash", "hash"}
+VERSION_ENTRY_FIELDS = {"version", "approval_mode", "holders", "approvers"}
+APPROVAL_MODES = ("legacy", "separated")
 
 
 def encode(value: Any) -> str:
@@ -195,6 +204,22 @@ def _parse_event(raw: Any) -> dict[str, Any]:
     return event
 
 
+def _parse_version_entry(raw: Any) -> dict[str, Any]:
+    entry = _require_object(raw, VERSION_ENTRY_FIELDS, "versions entry")
+    positive_int(entry["version"], "versions entry version", 1)
+    if entry["approval_mode"] not in APPROVAL_MODES:
+        raise ValidationError("versions entry approval_mode must be legacy or separated")
+    for field in ("holders", "approvers"):
+        values = entry[field]
+        if not isinstance(values, list) or not values:
+            raise ValidationError(f"versions entry {field} must be a non-empty array of identifiers")
+        for value in values:
+            identifier(value, f"versions entry {field} entry")
+        if len(set(values)) != len(values):
+            raise ValidationError(f"versions entry {field} must not repeat the same identifier")
+    return entry
+
+
 def _parse(backup: Any) -> dict[str, Any]:
     if not isinstance(backup, dict):
         raise ValidationError("backup must be an object")
@@ -203,12 +228,16 @@ def _parse(backup: Any) -> dict[str, Any]:
         fields = TOP_LEVEL_FIELDS
     elif version == BACKUP_VERSION_V2:
         fields = TOP_LEVEL_FIELDS_V2
+    elif version == BACKUP_VERSION_V3:
+        fields = TOP_LEVEL_FIELDS_V3
     else:
-        raise ValidationError(f"backup_version must be {BACKUP_VERSION_V1} or {BACKUP_VERSION_V2}")
+        raise ValidationError(
+            f"backup_version must be {BACKUP_VERSION_V1}, {BACKUP_VERSION_V2} or {BACKUP_VERSION_V3}"
+        )
     document = _require_object(backup, fields, "backup")
     _non_empty_text(document["generated_at"], "generated_at")
     _hash_text(document["checksum"], "checksum")
-    if version == BACKUP_VERSION_V2 and document["authorization_policy"] is not None:
+    if version in (BACKUP_VERSION_V2, BACKUP_VERSION_V3) and document["authorization_policy"] is not None:
         parse_policy(document["authorization_policy"])
     shares = document["shares"]
     if not isinstance(shares, list):
@@ -219,9 +248,16 @@ def _parse(backup: Any) -> dict[str, Any]:
     events = document["audit_events"]
     if not isinstance(events, list):
         raise ValidationError("audit_events must be an array")
+    versions: list[dict[str, Any]] | None = None
+    if version == BACKUP_VERSION_V3:
+        entries = document["versions"]
+        if not isinstance(entries, list) or not entries:
+            raise ValidationError("versions must be a non-empty array")
+        versions = [_parse_version_entry(entry) for entry in entries]
     return {
         "raw": document,
         "secret": _parse_secret(document["secret"]),
+        "versions": versions,
         "shares": [_parse_share(entry) for entry in shares],
         "approvals": [_parse_approval(entry) for entry in approvals],
         "audit_events": [_parse_event(entry) for entry in events],
@@ -256,6 +292,34 @@ def _check_integrity(parsed: dict[str, Any]) -> None:
     for share in shares:
         roster.setdefault(share["version"], set()).add(share["holder"])
 
+    # Role attribution: a v3 document pins the holder and approver rosters of
+    # every version; v1/v2 documents are read in legacy mode, where the
+    # approvers of a version are exactly its holders.
+    versions = parsed["versions"]
+    if versions is not None:
+        if [entry["version"] for entry in versions] != list(range(1, current + 1)):
+            raise BackupIntegrity("versions do not cover every version from 1 to the current version")
+        approver_roster: dict[int, set[str]] = {}
+        for entry in versions:
+            holders = set(entry["holders"])
+            approvers = set(entry["approvers"])
+            if holders != roster[entry["version"]]:
+                raise BackupIntegrity(
+                    f"version {entry['version']} holders do not match the shares issued for it"
+                )
+            if entry["approval_mode"] == "legacy":
+                if approvers != holders:
+                    raise BackupIntegrity(
+                        f"version {entry['version']} is legacy but its approvers differ from its holders"
+                    )
+            elif holders & approvers:
+                raise BackupIntegrity(
+                    f"version {entry['version']} approvers overlap its holders"
+                )
+            approver_roster[entry["version"]] = approvers
+    else:
+        approver_roster = roster
+
     for approval in parsed["approvals"]:
         if approval["secret_id"] != secret_id:
             raise BackupIntegrity(f"approval by {approval['approver']} does not belong to secret {secret_id}")
@@ -263,9 +327,9 @@ def _check_integrity(parsed: dict[str, Any]) -> None:
             raise BackupIntegrity(
                 f"approval by {approval['approver']} targets a version outside 1..{current}"
             )
-        if approval["approver"] not in roster[approval["version"]]:
+        if approval["approver"] not in approver_roster[approval["version"]]:
             raise BackupIntegrity(
-                f"approver {approval['approver']} is not a holder of version {approval['version']}"
+                f"approver {approval['approver']} is not an approver of version {approval['version']}"
             )
 
     previous = ZERO_HASH

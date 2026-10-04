@@ -37,7 +37,7 @@ from .model import (
     ShareClaim,
     parse_share_claims,
     reason_field,
-    resolve_policy,
+    resolve_roles,
     single_field,
 )
 from .policy import evaluate as evaluate_policy
@@ -78,6 +78,8 @@ class ThresholdSafe:
         def create() -> dict[str, Any]:
             now = self.store.now()
             points = shamir.split(spec.secret, spec.threshold, len(spec.holders), self._source(spec.seed))
+            mode = "separated" if spec.approvers is not None else "legacy"
+            approvers = list(spec.approvers) if spec.approvers is not None else list(spec.holders)
             document = {
                 "id": spec.id,
                 "name": spec.name,
@@ -85,6 +87,14 @@ class ThresholdSafe:
                 "threshold": spec.threshold,
                 "holders": list(spec.holders),
                 "approvals_required": spec.approvals_required,
+                "approval_mode": mode,
+                "approvers": list(spec.approvers) if spec.approvers is not None else None,
+                "versions": [{
+                    "version": 1,
+                    "approval_mode": mode,
+                    "holders": list(spec.holders),
+                    "approvers": approvers,
+                }],
                 "secret_digest": _secret_digest(spec.secret),
                 "secret_length": len(spec.secret),
                 "policy": spec.policy,
@@ -110,6 +120,8 @@ class ThresholdSafe:
                 "name": spec.name,
                 "threshold": spec.threshold,
                 "approvals_required": spec.approvals_required,
+                "approval_mode": mode,
+                "approvers": approvers,
                 "holders": list(spec.holders),
                 "share_count": len(spec.holders),
                 "secret_length": len(spec.secret),
@@ -245,8 +257,10 @@ class ThresholdSafe:
         def record() -> dict[str, Any]:
             document = self._document(secret_id)
             self._require_active(document, secret_id)
-            if approver not in document["holders"]:
-                raise ValidationError(f"approver {approver} is not a registered holder of secret {secret_id}")
+            mode, approvers = self._roles(document)
+            if approver not in approvers:
+                role = "approver" if mode == "separated" else "holder"
+                raise ValidationError(f"approver {approver} is not a registered {role} of secret {secret_id}")
             version = document["version"]
             existing = self.store.connection.execute(
                 "SELECT consumed_at FROM approvals WHERE secret_id = ? AND version = ? AND approver = ?",
@@ -269,8 +283,14 @@ class ThresholdSafe:
                 )
             recorded = self._approval_count(secret_id, version)
             required = document["approvals_required"]
-            self._append(secret_id, "approval_recorded",
-                         {"approver": approver, "version": version, "approvals": recorded, "required": required})
+            self._append(secret_id, "approval_recorded", {
+                "approver": approver,
+                "version": version,
+                "approvals": recorded,
+                "required": required,
+                "approval_mode": mode,
+                "approvers": approvers,
+            })
             return {
                 "secret_id": secret_id,
                 "approver": approver,
@@ -384,7 +404,18 @@ class ThresholdSafe:
             approvals_required = (
                 spec.approvals_required if spec.approvals_required is not None else document["approvals_required"]
             )
-            resolve_policy(threshold, holders, approvals_required)
+            # Resolve the target approval mode before touching any state: an
+            # omitted approvers field continues the current mode (legacy follows
+            # the final holders, separated keeps its roster), an explicit null
+            # returns to legacy, and an array installs a separated roster.
+            if spec.approvers is UNSET:
+                mode = document.get("approval_mode", "legacy")
+                approvers = list(document["approvers"]) if mode == "separated" else None
+            elif spec.approvers is None:
+                mode, approvers = "legacy", None
+            else:
+                mode, approvers = "separated", list(spec.approvers)
+            resolve_roles(threshold, holders, approvals_required, mode, approvers)
             self._authorize(secret_id, document, "rotate", previous, recorded, 0)
             secret = spec.secret if spec.secret is not None else self._recover(secret_id, document)
             now = self.store.now()
@@ -395,11 +426,25 @@ class ThresholdSafe:
             ).rowcount
             version = previous + 1
             self._issue(version, secret_id, holders, shamir.split(secret, threshold, len(holders), self._source(spec.seed)))
+            history = document.get("versions")
+            if history is None:
+                # A document written before approval modes existed: every past
+                # version is legacy, with the holders acting as approvers.
+                history = self._legacy_history(secret_id, previous)
+            effective = approvers if approvers is not None else list(holders)
+            document["versions"] = history + [{
+                "version": version,
+                "approval_mode": mode,
+                "holders": list(holders),
+                "approvers": effective,
+            }]
             document.update({
                 "version": version,
                 "threshold": threshold,
                 "holders": list(holders),
                 "approvals_required": approvals_required,
+                "approval_mode": mode,
+                "approvers": approvers,
                 "secret_digest": _secret_digest(secret),
                 "secret_length": len(secret),
                 "updated_at": now,
@@ -415,6 +460,8 @@ class ThresholdSafe:
                 "previous_version": previous,
                 "threshold": threshold,
                 "approvals_required": approvals_required,
+                "approval_mode": mode,
+                "approvers": effective,
                 "holders": list(holders),
                 "share_count": len(holders),
                 "invalidated_shares": invalidated,
@@ -450,11 +497,21 @@ class ThresholdSafe:
             "WHERE secret_id = ? ORDER BY sequence",
             (secret_id,),
         ).fetchall()
+        versions = document.get("versions")
+        if versions is None:
+            # A document written before approval modes existed: derive the
+            # per-version rosters from the shares, all in legacy mode.
+            versions = self._legacy_history(secret_id, document["version"])
         return _stamp({
             "backup_version": BACKUP_VERSION,
             "generated_at": self.store.now(),
             "authorization_policy": document.get("policy"),
-            "secret": {key: value for key, value in document.items() if key != "policy"},
+            "secret": {
+                key: value
+                for key, value in document.items()
+                if key not in ("policy", "approval_mode", "approvers", "versions")
+            },
+            "versions": [dict(entry) for entry in versions],
             "shares": [dict(row) for row in shares],
             "approvals": [dict(row) for row in approvals],
             "audit_events": [
@@ -509,6 +566,38 @@ class ThresholdSafe:
         }
 
     # ------------------------------------------------------------------ helpers
+    @staticmethod
+    def _roles(document: dict[str, Any]) -> tuple[str, list[str]]:
+        """Effective approval mode and approver roster of the current version.
+
+        Documents written before approval modes existed carry no role fields
+        and are read as legacy: the holders are the approvers.
+        """
+        mode = document.get("approval_mode", "legacy")
+        if mode == "separated":
+            return mode, list(document["approvers"])
+        return "legacy", list(document["holders"])
+
+    def _legacy_history(self, secret_id: str, upto: int) -> list[dict[str, Any]]:
+        """Per-version role snapshots for a pre-roles document, all legacy."""
+        rows = self.store.connection.execute(
+            "SELECT version, holder FROM shares WHERE secret_id = ? AND version <= ? "
+            "ORDER BY version, coordinate",
+            (secret_id, upto),
+        ).fetchall()
+        history: list[dict[str, Any]] = []
+        for row in rows:
+            if not history or history[-1]["version"] != row["version"]:
+                history.append({
+                    "version": row["version"],
+                    "approval_mode": "legacy",
+                    "holders": [],
+                    "approvers": [],
+                })
+            history[-1]["holders"].append(row["holder"])
+            history[-1]["approvers"].append(row["holder"])
+        return history
+
     def _source(self, seed: int | None) -> RandomSource:
         return SeededRandomSource(seed) if seed is not None else self.source
 
@@ -544,6 +633,7 @@ class ThresholdSafe:
         ).fetchall()
         recorded = self._approval_count(secret_id, document["version"])
         required = document["approvals_required"]
+        mode, approvers = self._roles(document)
         return {
             "id": secret_id,
             "name": document["name"],
@@ -551,6 +641,8 @@ class ThresholdSafe:
             "threshold": document["threshold"],
             "holders": list(document["holders"]),
             "approvals_required": required,
+            "approval_mode": mode,
+            "approvers": approvers,
             "share_count": len(rows),
             "distributed_shares": sum(1 for row in rows if row["distributed_at"] is not None),
             "approvals": {"recorded": recorded, "required": required, "satisfied": recorded >= required},
