@@ -46,6 +46,10 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_secret(parts[1])
         if self.command == "POST" and parts == ["backups", "verify"]:
             return 200, self.service.verify_backup(self._body())
+        if self.command == "GET" and parts == ["audit", "receipt-key"]:
+            return 200, self.service.receipt_key_info()
+        if self.command == "POST" and parts == ["audit", "receipts", "verify"]:
+            return 200, self.service.verify_receipt(self._body())
         if len(parts) == 3 and parts[0] == "secrets":
             if parts[2] == "audit" and self.command == "GET":
                 return 200, self.service.audit(parts[1])
@@ -62,6 +66,7 @@ class Handler(BaseHTTPRequestHandler):
                     "rotate": (200, self.service.rotate),
                     "freeze": (200, self.service.freeze_secret),
                     "unfreeze": (200, self.service.unfreeze_secret),
+                    "audit-receipts": (201, self.service.issue_audit_receipt),
                 }
                 if parts[2] in actions:
                     status, action = actions[parts[2]]

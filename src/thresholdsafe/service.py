@@ -4,7 +4,7 @@ import hashlib
 import sqlite3
 from typing import Any, Callable
 
-from . import shamir
+from . import receipts, shamir
 from .backup import (
     BACKUP_VERSION,
     ZERO_HASH,
@@ -14,6 +14,7 @@ from .backup import (
     verify as _verify,
 )
 from .errors import (
+    AuditIntegrity,
     ConflictError,
     DuplicateApproval,
     InsufficientApprovals,
@@ -36,6 +37,7 @@ from .model import (
     SecretSpec,
     ShareClaim,
     parse_share_claims,
+    positive_int,
     reason_field,
     resolve_roles,
     single_field,
@@ -70,6 +72,31 @@ class ThresholdSafe:
     def __init__(self, database: str, source: RandomSource | None = None):
         self.store = Store(database)
         self.source: RandomSource = source if source is not None else SystemRandomSource()
+        self.receipt_key = self._load_receipt_key()
+
+    def _load_receipt_key(self) -> receipts.ReceiptKey:
+        """Load the receipt signing key, generating and persisting it once.
+
+        The key lives in the database so every instance serving the same
+        database signs with the same key; the ``BEGIN IMMEDIATE`` transaction
+        serialises concurrent first starts, which then converge on the stored
+        key. The private seed is kept in memory and never appears in any
+        response or backup.
+        """
+        with self.store.transaction() as connection:
+            row = connection.execute(
+                "SELECT private_key, public_key, key_id FROM receipt_signing_key WHERE id = 1"
+            ).fetchone()
+            if row is None:
+                key = receipts.ReceiptKey.generate()
+                connection.execute(
+                    "INSERT INTO receipt_signing_key(id, private_key, public_key, key_id, created_at) "
+                    "VALUES (1, ?, ?, ?, ?)",
+                    (receipts.b64url_encode(key.seed), receipts.b64url_encode(key.public_key),
+                     key.key_id, self.store.now()),
+                )
+                return key
+            return receipts.ReceiptKey.load(row["private_key"], row["public_key"], row["key_id"])
 
     # ------------------------------------------------------------------ create
     def create_secret(self, raw: Any, key: str | None) -> dict[str, Any]:
@@ -536,6 +563,17 @@ class ThresholdSafe:
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
         document = self._document(secret_id)
+        events, chain_valid, head = self._chain(secret_id)
+        return {
+            "secret_id": secret_id,
+            "version": document["version"],
+            "chain_valid": chain_valid,
+            "head_hash": head,
+            "events": events,
+        }
+
+    def _chain(self, secret_id: str) -> tuple[list[dict[str, Any]], bool, str]:
+        """The decoded audit events of one secret, chain validity and head hash."""
         rows = self.store.connection.execute(
             "SELECT sequence, type, payload, occurred_at, previous_hash, hash FROM audit_events "
             "WHERE secret_id = ? ORDER BY sequence",
@@ -557,13 +595,64 @@ class ThresholdSafe:
             if row["previous_hash"] != previous or row["hash"] != expected:
                 chain_valid = False
             previous = row["hash"]
-        return {
-            "secret_id": secret_id,
-            "version": document["version"],
-            "chain_valid": chain_valid,
-            "head_hash": previous,
-            "events": events,
-        }
+        return events, chain_valid, previous
+
+    # ----------------------------------------------------------------- receipts
+    def receipt_key_info(self) -> dict[str, Any]:
+        """The public receipt verification key. Read-only: nothing is written."""
+        return self.receipt_key.info()
+
+    def issue_audit_receipt(self, secret_id: str, raw: Any, key: str | None) -> dict[str, Any]:
+        """Issue a signed Ed25519 receipt attesting to one audit event.
+
+        The existing chain is verified first: a broken chain rejects the
+        request with ``audit_integrity`` and nothing is written. On success an
+        ``audit_receipt_issued`` event naming the target sequence, the nonce
+        and the key id is appended in the same transaction, and the receipt
+        signs every returned field but the signature itself. Freezing a secret
+        does not block receipt issuance.
+        """
+        self._require_key(key)
+        if not isinstance(raw, dict) or set(raw) != {"sequence", "nonce"}:
+            raise ValidationError("audit receipt body must contain exactly sequence and nonce")
+        sequence = positive_int(raw["sequence"], "sequence", 1)
+        nonce = receipts.check_nonce(raw["nonce"])
+        operation = self.store.encode(["audit-receipt", secret_id, sequence, nonce])
+
+        def issue() -> dict[str, Any]:
+            self._document(secret_id)
+            events, chain_valid, _ = self._chain(secret_id)
+            if not chain_valid:
+                raise AuditIntegrity(f"the audit chain of secret {secret_id} is broken")
+            target = next((event for event in events if event["sequence"] == sequence), None)
+            if target is None:
+                raise NotFoundError(f"secret {secret_id} has no audit event with sequence {sequence}")
+            self._append(secret_id, "audit_receipt_issued", {
+                "sequence": sequence,
+                "nonce": nonce,
+                "key_id": self.receipt_key.key_id,
+            })
+            head = self.store.connection.execute(
+                "SELECT sequence, hash FROM audit_events WHERE secret_id = ? ORDER BY sequence DESC LIMIT 1",
+                (secret_id,),
+            ).fetchone()
+            receipt = {
+                "algorithm": receipts.ALGORITHM,
+                "key_id": self.receipt_key.key_id,
+                "secret_id": secret_id,
+                "event": target,
+                "nonce": nonce,
+                "head_sequence": head["sequence"],
+                "head_hash": head["hash"],
+            }
+            receipt["signature"] = self.receipt_key.sign(receipt)
+            return receipt
+
+        return self._idempotent(key, operation, issue)
+
+    def verify_receipt(self, raw: Any) -> dict[str, Any]:
+        """Independently verify a receipt without touching managed state."""
+        return receipts.verify(raw)
 
     # ------------------------------------------------------------------ helpers
     @staticmethod

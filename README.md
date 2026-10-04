@@ -41,6 +41,10 @@ The initial release supports a compact public contract:
   reconstruction and rotation beyond the fixed approval requirement;
 - every accepted or rejected custody action is appended to a per-secret
   hash-linked audit stream;
+- any audit event can be anchored by an Ed25519-signed receipt: the service
+  appends an `audit_receipt_issued` event and signs the target event, a
+  caller-chosen nonce and the new chain head, so clients can verify the
+  service's attestation offline against the published public key;
 - a secret can be exported as a self-contained, checksummed JSON backup, and
   any backup document can be verified independently without touching service
   state;
@@ -50,7 +54,7 @@ The initial release supports a compact public contract:
 ## Requirements
 
 - Python 3.11 or newer
-- no third-party runtime dependencies
+- [`cryptography`](https://cryptography.io/) 42 or newer (Ed25519 audit receipts)
 
 ## Run the service
 
@@ -417,7 +421,7 @@ its integrity:
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
 `approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
 `secret_frozen`, `secret_unfrozen`, `operation_blocked`,
-`authorization_denied` and `reconstruction_failed`. The `secret_created`,
+`authorization_denied`, `reconstruction_failed` and `audit_receipt_issued`. The `secret_created`,
 `approval_recorded` and `secret_rotated` payloads carry the version's role
 information (`approval_mode` and the effective `approvers` roster) alongside
 their other fields. Sequences start at 1 and have no gaps. Each event
@@ -497,6 +501,82 @@ verification never partially accepts. A valid backup returns HTTP 200:
 {"valid":true,"secret_id":"prod-db-root","version":1,"share_count":5,"approval_count":2,"event_count":8}
 ```
 
+### Receipt signing key
+
+```http
+GET /audit/receipt-key
+```
+
+Returns the public half of the service's Ed25519 receipt signing key:
+
+```json
+{"algorithm":"Ed25519","key_id":"af97972a6b3807f305055a7d531352246a13fbdacdf688a770ce688e875362e2","public_key":"W9Uh17v5zsGdS6FP5HXEf7Puu1cTNmxzHGLGmK6bcu0"}
+```
+
+`key_id` is the lowercase hexadecimal SHA-256 digest of the raw public key;
+`public_key` is the raw 32-byte public key encoded as URL-safe Base64 without
+padding. The key is generated once and persisted in the database, so every
+instance serving the same database signs with the same key; the private key
+never appears in any response or backup. Reading is read-only: no
+`Idempotency-Key`, no audit event, no writes.
+
+### Issue an audit receipt
+
+```http
+POST /secrets/prod-db-root/audit-receipts
+Idempotency-Key: receipt-1
+Content-Type: application/json
+
+{"sequence":1,"nonce":"audit-2026-10-04"}
+```
+
+Issues a signed receipt attesting to one existing audit event of the secret.
+The body must contain exactly `sequence` (a positive integer identifying an
+event of this secret) and `nonce` (a non-empty string of at most 128 UTF-8
+bytes, preserved verbatim). The service first re-verifies the whole audit
+chain: a broken chain is `409 audit_integrity`, an unknown secret or event
+sequence is `404 not_found`, a malformed body is `400 validation_error`, and
+no failure writes anything. Freezing a secret does not block issuance. On
+success an `audit_receipt_issued` event — whose payload carries the target
+`sequence`, the `nonce` and the `key_id` — is appended in the same
+transaction, and HTTP 201 returns:
+
+```json
+{"algorithm":"Ed25519","key_id":"af97...62e2","secret_id":"prod-db-root","event":{"sequence":1,"type":"secret_created","payload":{...},"occurred_at":"...","previous_hash":"00...00","hash":"dbba...c44"},"nonce":"audit-2026-10-04","head_sequence":2,"head_hash":"d5ea...1230","signature":"YfLl...qAg"}
+```
+
+`head_sequence` and `head_hash` point at the `audit_receipt_issued` event
+itself. `signature` is the Ed25519 signature — URL-safe Base64 without
+padding — over the UTF-8 canonical JSON (sorted keys, compact separators) of
+every other field. Replaying the same request with the same `Idempotency-Key`
+returns the stored response without appending another event; reusing the key
+with a different secret, `sequence` or `nonce` is `409 conflict`. Concurrent
+issuance under one key behaves exactly like serial replay: at most one
+`audit_receipt_issued` event is appended.
+
+### Verify a receipt
+
+```http
+POST /audit/receipts/verify
+Content-Type: application/json
+
+{"receipt": { ...issued receipt... }, "public_key": "W9Uh17v5zsGdS6FP5HXEf7Puu1cTNmxzHGLGmK6bcu0"}
+```
+
+Independently verifies a receipt. The body must contain exactly `receipt` and
+`public_key`; no `Idempotency-Key` is required, and the service neither reads
+nor modifies any managed state. Structural or encoding problems (missing,
+extra or wrongly typed fields, malformed digests or Base64) are
+`400 validation_error`. A well-formed request whose contents do not check
+out returns HTTP 200 with `valid: false` and a `reason`: `receipt_integrity`
+when the event hash does not recompute or `key_id` does not match the
+supplied `public_key`, and `signature_mismatch` when the Ed25519 signature
+does not verify. A fully consistent receipt returns:
+
+```json
+{"valid":true}
+```
+
 ## Data model
 
 | Table | Key | Contents |
@@ -506,6 +586,7 @@ verification never partially accepts. A valid backup returns HTTP 200:
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
 | `idempotency` | `key` | operation name, stored response |
+| `receipt_signing_key` | singleton row | Ed25519 receipt key: private seed (never exported), public key, `key_id`, `created_at` |
 
 Issuance, distribution, approval, reconstruction, rotation and freeze or
 unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
@@ -552,6 +633,7 @@ Errors use this shape:
 | `secret_frozen` | 409 | the secret is frozen, or a freeze was requested while already frozen |
 | `secret_not_frozen` | 409 | an unfreeze was requested while the secret was active |
 | `backup_integrity` | 409 | a structurally valid backup fails checksum or internal consistency checks |
+| `audit_integrity` | 409 | the audit chain of the secret is broken, so no receipt can be issued |
 | `internal_error` | 500 | unexpected server failure |
 
 ## Tests

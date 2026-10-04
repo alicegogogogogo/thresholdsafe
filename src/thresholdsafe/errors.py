@@ -54,6 +54,10 @@ class BackupIntegrity(ConflictError):
     code = "backup_integrity"
 
 
+class AuditIntegrity(ConflictError):
+    code = "audit_integrity"
+
+
 class SecretFrozen(ConflictError):
     code = "secret_frozen"
 
