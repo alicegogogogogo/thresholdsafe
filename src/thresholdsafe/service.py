@@ -37,7 +37,7 @@ from .model import (
     ShareClaim,
     parse_share_claims,
     reason_field,
-    resolve_policy,
+    resolve_roles,
     single_field,
 )
 from .policy import evaluate as evaluate_policy
@@ -85,6 +85,8 @@ class ThresholdSafe:
                 "threshold": spec.threshold,
                 "holders": list(spec.holders),
                 "approvals_required": spec.approvals_required,
+                "approval_mode": spec.approval_mode,
+                "approvers": list(spec.approvers),
                 "secret_digest": _secret_digest(spec.secret),
                 "secret_length": len(spec.secret),
                 "policy": spec.policy,
@@ -105,12 +107,15 @@ class ThresholdSafe:
                     raise
                 raise ConflictError(f"secret {spec.id} already exists") from error
             self._issue(1, spec.id, spec.holders, points)
+            self._record_roles(spec.id, 1, spec.holders, spec.approvers)
             self._append(spec.id, "secret_created", {
                 "version": 1,
                 "name": spec.name,
                 "threshold": spec.threshold,
                 "approvals_required": spec.approvals_required,
                 "holders": list(spec.holders),
+                "approval_mode": spec.approval_mode,
+                "approvers": list(spec.approvers),
                 "share_count": len(spec.holders),
                 "secret_length": len(spec.secret),
                 "deterministic": spec.seed is not None,
@@ -245,7 +250,12 @@ class ThresholdSafe:
         def record() -> dict[str, Any]:
             document = self._document(secret_id)
             self._require_active(document, secret_id)
-            if approver not in document["holders"]:
+            mode, approvers = self._roles(document)
+            if approver not in approvers:
+                if mode == "separated":
+                    raise ValidationError(
+                        f"approver {approver} is not a registered approver of secret {secret_id}"
+                    )
                 raise ValidationError(f"approver {approver} is not a registered holder of secret {secret_id}")
             version = document["version"]
             existing = self.store.connection.execute(
@@ -269,8 +279,14 @@ class ThresholdSafe:
                 )
             recorded = self._approval_count(secret_id, version)
             required = document["approvals_required"]
-            self._append(secret_id, "approval_recorded",
-                         {"approver": approver, "version": version, "approvals": recorded, "required": required})
+            self._append(secret_id, "approval_recorded", {
+                "approver": approver,
+                "version": version,
+                "approvals": recorded,
+                "required": required,
+                "approval_mode": mode,
+                "approvers": approvers,
+            })
             return {
                 "secret_id": secret_id,
                 "approver": approver,
@@ -384,7 +400,18 @@ class ThresholdSafe:
             approvals_required = (
                 spec.approvals_required if spec.approvals_required is not None else document["approvals_required"]
             )
-            resolve_policy(threshold, holders, approvals_required)
+            mode, approvers = self._roles(document)
+            if spec.approvers is UNSET:
+                # The mode continues: legacy follows the final holders, while
+                # separated keeps its existing approver roster.
+                if mode == "legacy":
+                    approvers = list(holders)
+            elif spec.approvers is None:
+                mode, approvers = "legacy", list(holders)
+            else:
+                mode, approvers = "separated", list(spec.approvers)
+            # The target configuration is validated before anything mutates.
+            resolve_roles(threshold, holders, approvals_required, mode, tuple(approvers))
             self._authorize(secret_id, document, "rotate", previous, recorded, 0)
             secret = spec.secret if spec.secret is not None else self._recover(secret_id, document)
             now = self.store.now()
@@ -395,11 +422,14 @@ class ThresholdSafe:
             ).rowcount
             version = previous + 1
             self._issue(version, secret_id, holders, shamir.split(secret, threshold, len(holders), self._source(spec.seed)))
+            self._record_roles(secret_id, version, holders, approvers)
             document.update({
                 "version": version,
                 "threshold": threshold,
                 "holders": list(holders),
                 "approvals_required": approvals_required,
+                "approval_mode": mode,
+                "approvers": list(approvers),
                 "secret_digest": _secret_digest(secret),
                 "secret_length": len(secret),
                 "updated_at": now,
@@ -416,6 +446,8 @@ class ThresholdSafe:
                 "threshold": threshold,
                 "approvals_required": approvals_required,
                 "holders": list(holders),
+                "approval_mode": mode,
+                "approvers": list(approvers),
                 "share_count": len(holders),
                 "invalidated_shares": invalidated,
                 "secret_changed": spec.secret is not None,
@@ -457,6 +489,7 @@ class ThresholdSafe:
             "secret": {key: value for key, value in document.items() if key != "policy"},
             "shares": [dict(row) for row in shares],
             "approvals": [dict(row) for row in approvals],
+            "roles": self._role_snapshots(document, shares),
             "audit_events": [
                 {
                     "sequence": row["sequence"],
@@ -551,6 +584,8 @@ class ThresholdSafe:
             "threshold": document["threshold"],
             "holders": list(document["holders"]),
             "approvals_required": required,
+            "approval_mode": document["approval_mode"],
+            "approvers": list(document["approvers"]),
             "share_count": len(rows),
             "distributed_shares": sum(1 for row in rows if row["distributed_at"] is not None),
             "approvals": {"recorded": recorded, "required": required, "satisfied": recorded >= required},
@@ -566,7 +601,54 @@ class ThresholdSafe:
         row = self.store.connection.execute("SELECT document FROM secrets WHERE id = ?", (secret_id,)).fetchone()
         if row is None:
             raise NotFoundError(f"secret {secret_id} was not found")
-        return self.store.decode(row["document"])
+        document = self.store.decode(row["document"])
+        # Records written before the role model existed are read as legacy:
+        # their approvers are exactly the holders.
+        document.setdefault("approval_mode", "legacy")
+        document.setdefault("approvers", list(document["holders"]))
+        return document
+
+    @staticmethod
+    def _roles(document: dict[str, Any]) -> tuple[str, list[str]]:
+        return document["approval_mode"], list(document["approvers"])
+
+    def _record_roles(
+        self, secret_id: str, version: int, holders: tuple[str, ...], approvers: Any
+    ) -> None:
+        self.store.connection.execute(
+            "INSERT INTO secret_roles(secret_id, version, holders, approvers) VALUES (?, ?, ?, ?)",
+            (secret_id, version, self.store.encode(list(holders)), self.store.encode(list(approvers))),
+        )
+
+    def _role_snapshots(self, document: dict[str, Any], shares: list[sqlite3.Row]) -> list[dict[str, Any]]:
+        """Per-version holders/approvers snapshots for a backup, versions 1..current.
+
+        Versions without a stored row predate the role model and are reported
+        as legacy: their approvers were exactly their holders.
+        """
+        stored = {
+            row["version"]: row
+            for row in self.store.connection.execute(
+                "SELECT version, holders, approvers FROM secret_roles WHERE secret_id = ? ORDER BY version",
+                (document["id"],),
+            ).fetchall()
+        }
+        roster: dict[int, list[str]] = {}
+        for share in shares:
+            roster.setdefault(share["version"], []).append(share["holder"])
+        snapshots = []
+        for version in range(1, document["version"] + 1):
+            row = stored.get(version)
+            if row is not None:
+                snapshots.append({
+                    "version": version,
+                    "holders": self.store.decode(row["holders"]),
+                    "approvers": self.store.decode(row["approvers"]),
+                })
+            else:
+                holders = roster.get(version, [])
+                snapshots.append({"version": version, "holders": holders, "approvers": list(holders)})
+        return snapshots
 
     def _approval_count(self, secret_id: str, version: int) -> int:
         row = self.store.connection.execute(

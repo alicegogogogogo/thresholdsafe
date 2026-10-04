@@ -45,6 +45,13 @@ CREATE TABLE IF NOT EXISTS audit_events (
   hash TEXT NOT NULL,
   PRIMARY KEY (secret_id, sequence)
 );
+CREATE TABLE IF NOT EXISTS secret_roles (
+  secret_id TEXT NOT NULL REFERENCES secrets(id),
+  version INTEGER NOT NULL,
+  holders TEXT NOT NULL,
+  approvers TEXT NOT NULL,
+  PRIMARY KEY (secret_id, version)
+);
 CREATE TABLE IF NOT EXISTS idempotency (
   key TEXT PRIMARY KEY,
   operation TEXT NOT NULL,

@@ -25,6 +25,10 @@ The initial release supports a compact public contract:
 - an undistributed share is never accepted for reconstruction;
 - reconstruction needs `threshold` distributed shares **and**
   `approvals_required` distinct holder approvals for the current version;
+- an optional role model separates custody from approval: a secret created
+  with an explicit `approvers` roster runs in `separated` mode, where shares
+  still go to the holders but only the listed approvers — at least two of
+  them, none of them holders — can approve;
 - approvals are version-scoped and single-use, consumed by a successful
   reconstruction or rotation;
 - rotation issues a new version, invalidates every previous share, and is
@@ -101,11 +105,18 @@ holders; `secret` is a non-empty string encoding to at most 64 UTF-8 bytes
 optional `policy` is an authorization-policy expression (see Authorization
 policy) that gates later reconstructions and rotations.
 
+The optional `approvers` selects the approval mode. Omitting it (or passing
+`null`) keeps the `legacy` mode, in which the holders are the approvers.
+Passing an explicit array enables `separated` mode: the array must contain at
+least two unique identifiers and must not overlap the holders at all, and
+`approvals_required` must then lie between 2 and the number of approvers
+(inclusive). Any violation is `400 validation_error` and nothing is created.
+
 Returns HTTP 201 with the custody record, which never contains share material
 or the secret itself:
 
 ```json
-{"id":"prod-db-root","name":"Production database root key","version":1,"threshold":3,"holders":["alice","bob","carol","dave","erin"],"approvals_required":2,"share_count":5,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":13,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:53:59.148364Z","created_at":"2026-10-02T05:53:59.148364Z","updated_at":"2026-10-02T05:53:59.148364Z"}
+{"id":"prod-db-root","name":"Production database root key","version":1,"threshold":3,"holders":["alice","bob","carol","dave","erin"],"approvals_required":2,"approval_mode":"legacy","approvers":["alice","bob","carol","dave","erin"],"share_count":5,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":13,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:53:59.148364Z","created_at":"2026-10-02T05:53:59.148364Z","updated_at":"2026-10-02T05:53:59.148364Z"}
 ```
 
 ### Inspect a secret
@@ -116,7 +127,10 @@ GET /secrets/prod-db-root
 
 Returns the same custody record, so a client can see the current version, the
 roster, how many shares have been distributed, and whether the approval policy
-is currently satisfied. The record also carries `status` (`active` or
+is currently satisfied. `approval_mode` (`legacy` or `separated`) and
+`approvers` describe the roles of the current version: in `legacy` mode
+`approvers` mirrors `holders`, in `separated` mode it is the distinct
+approver roster. The record also carries `status` (`active` or
 `frozen`), `status_reason` (the reason recorded by the latest freeze or
 unfreeze, or `null` when the secret has never been frozen) and
 `status_changed_at`. Unknown secrets return 404.
@@ -276,9 +290,12 @@ Returns HTTP 201:
 {"secret_id":"prod-db-root","approver":"alice","version":1,"approvals":1,"required":2,"satisfied":false,"recorded_at":"2026-10-02T05:53:59.239701Z"}
 ```
 
-The approver must be a registered holder. An approval belongs to one version
+The approver must belong to the current version's approver roster: the
+holders in `legacy` mode, the separate `approvers` list in `separated` mode
+(where holders who are not approvers are rejected, like any other
+identifier, with `400 validation_error`). An approval belongs to one version
 and is consumed by any successful reconstruction or rotation of that version;
-afterwards the same holder may approve again. Approving twice without an
+afterwards the same approver may approve again. Approving twice without an
 intervening consumption is `duplicate_approval`.
 
 ### Reconstruct a secret
@@ -356,14 +373,22 @@ Content-Type: application/json
 Every field is optional; omitted fields keep their current value, and `{}`
 re-issues shares for the same secret value. `policy` follows the same rule
 with one extension: an explicit `"policy": null` clears the authorization
-policy, while omitting the field preserves it. Rotation must satisfy the
-approvals currently required for the version it replaces, and those
-approvals are consumed; the currently stored authorization policy (not the
-one being installed) must also permit the rotation. Returns HTTP 200 with
-the new custody record:
+policy, while omitting the field preserves it. `approvers` behaves alike:
+omitting it continues the current mode (`legacy` re-derives the approvers
+from the final holders, `separated` keeps its existing roster), an explicit
+array installs or updates `separated` mode, and an explicit
+`"approvers": null` switches back to `legacy`. Rotation must satisfy the
+approvals currently required for the version it replaces — recorded by that
+version's own approver roster — and those approvals are consumed; the
+currently stored authorization policy (not the one being installed) must
+also permit the rotation. The target configuration is validated before
+anything changes: overlapping roles, an approver roster of fewer than two, a
+quota outside the bounds of its roster, or a roster change that strands the
+quota are all `400 validation_error` and leave the version, shares and
+approvals untouched. Returns HTTP 200 with the new custody record:
 
 ```json
-{"id":"prod-db-root","name":"Production database root key","version":2,"threshold":2,"holders":["frank","grace","heidi"],"approvals_required":2,"share_count":3,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":16,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:54:08.150075Z","created_at":"2026-10-02T05:54:08.150075Z","updated_at":"2026-10-02T05:54:08.384263Z"}
+{"id":"prod-db-root","name":"Production database root key","version":2,"threshold":2,"holders":["frank","grace","heidi"],"approvals_required":2,"approval_mode":"legacy","approvers":["frank","grace","heidi"],"share_count":3,"distributed_shares":0,"approvals":{"recorded":0,"required":2,"satisfied":false},"secret_length":16,"status":"active","status_reason":null,"status_changed_at":"2026-10-02T05:54:08.150075Z","created_at":"2026-10-02T05:54:08.150075Z","updated_at":"2026-10-02T05:54:08.384263Z"}
 ```
 
 Rotation increments the version, invalidates every share of the previous
@@ -384,13 +409,16 @@ Returns the ordered append-only event stream of one secret plus a verdict on
 its integrity:
 
 ```json
-{"secret_id":"prod-db-root","version":1,"chain_valid":true,"head_hash":"dbbab719935acb7ab8fdc1d45f8ae904bff7eb2ffef6fee154f70956d3400c44","events":[{"sequence":1,"type":"secret_created","payload":{"approvals_required":2,"deterministic":false,"holders":["alice","bob","carol","dave","erin"],"name":"Production database root key","secret_length":13,"share_count":5,"threshold":3,"version":1},"occurred_at":"2026-10-02T05:54:21.162864Z","previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"dbbab719935acb7ab8fdc1d45f8ae904bff7eb2ffef6fee154f70956d3400c44"}]}
+{"secret_id":"prod-db-root","version":1,"chain_valid":true,"head_hash":"dbbab719935acb7ab8fdc1d45f8ae904bff7eb2ffef6fee154f70956d3400c44","events":[{"sequence":1,"type":"secret_created","payload":{"approval_mode":"legacy","approvals_required":2,"approvers":["alice","bob","carol","dave","erin"],"deterministic":false,"holders":["alice","bob","carol","dave","erin"],"name":"Production database root key","secret_length":13,"share_count":5,"threshold":3,"version":1},"occurred_at":"2026-10-02T05:54:21.162864Z","previous_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"dbbab719935acb7ab8fdc1d45f8ae904bff7eb2ffef6fee154f70956d3400c44"}]}
 ```
 
 Event types are `secret_created`, `share_distributed`, `approval_recorded`,
 `approvals_consumed`, `secret_reconstructed`, `secret_rotated`,
 `secret_frozen`, `secret_unfrozen`, `operation_blocked`,
-`authorization_denied` and `reconstruction_failed`. Sequences start at 1 and have no gaps. Each event
+`authorization_denied` and `reconstruction_failed`. The `secret_created`,
+`approval_recorded` and `secret_rotated` payloads carry the roles of their
+version as `approval_mode` and `approvers`. Sequences start at 1 and have no
+gaps. Each event
 carries `previous_hash` and
 `hash = sha256("<previous_hash>|<sequence>|<type>|<canonical payload>|<occurred_at>")`,
 where the canonical payload is the JSON text with sorted keys and compact
@@ -415,15 +443,19 @@ custody and independent verification. Exporting is read-only: it needs no
 frozen. Unknown secrets return 404 `not_found`.
 
 The top level carries exactly `backup_version` (always
-`thresholdsafe-backup-v2` for new exports), `generated_at` (the usual UTC
+`thresholdsafe-backup-v3` for new exports), `generated_at` (the usual UTC
 timestamp), `authorization_policy` (the persistent authorization policy
-expression, or `null`), `secret`, `shares`, `approvals`, `audit_events` and
-`checksum`. `secret` is
-the stored record — including `secret_length` and `secret_digest`, never the
-plaintext. `shares` covers every version, each entry keeping `share_id`,
+expression, or `null`), `secret`, `shares`, `approvals`, `roles`,
+`audit_events` and `checksum`. `secret` is
+the stored record — including `approval_mode`, `approvers`, `secret_length`
+and `secret_digest`, never the plaintext. `shares` covers every version,
+each entry keeping `share_id`,
 `secret_id`, `version`, `holder`, `coordinate`, `value`, `commitment`,
 `distributed_at` and `invalidated_at`, so issued, distributed and invalidated
-shares stay distinguishable. `approvals` and `audit_events` are the complete
+shares stay distinguishable. `roles` is one `{version, holders, approvers}`
+snapshot per version from 1 to the current version, so a verifier can check
+that every share and every approval belongs to a role of its own version.
+`approvals` and `audit_events` are the complete
 tables for the secret. `checksum` is the lowercase hex SHA-256 of the other
 top-level values encoded as canonical JSON (sorted keys, compact separators),
 so field order and whitespace are irrelevant.
@@ -445,14 +477,18 @@ Independently verifies a backup document. The body must contain exactly
 `backup`; no `Idempotency-Key` is required, and the service neither reads nor
 modifies any state — nothing is audited and no idempotency record is stored.
 A malformed document (missing, extra or wrongly typed fields, an unsupported
-`backup_version`, or a syntactically invalid `authorization_policy` in a v2
-document) is `400 validation_error`. Both `thresholdsafe-backup-v1` (the
-original layout, without `authorization_policy`) and
-`thresholdsafe-backup-v2` documents are accepted. A well-formed document
+`backup_version`, a syntactically invalid `authorization_policy`, or a
+malformed `roles` snapshot in a v3 document) is `400 validation_error`.
+`thresholdsafe-backup-v1` (the original layout, without
+`authorization_policy`), `thresholdsafe-backup-v2` (without `roles`) and
+`thresholdsafe-backup-v3` documents are all accepted; v1 and v2 predate the
+role model and are read as `legacy`, with each version's approvers equal to
+its holders. A well-formed document
 whose checksum does not match, or whose secret ownership, version
-continuity,
-`share_id` ownership, share value/commitment pairs, approver ownership or
-audit ordering and chain hashes are inconsistent, is `409 backup_integrity`;
+continuity (of shares or of role snapshots),
+`share_id` ownership, share value/commitment pairs, share or approval role
+membership, or audit ordering and chain hashes are inconsistent, is
+`409 backup_integrity`;
 verification never partially accepts. A valid backup returns HTTP 200:
 
 ```json
@@ -463,11 +499,17 @@ verification never partially accepts. A valid backup returns HTTP 200:
 
 | Table | Key | Contents |
 | --- | --- | --- |
-| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, secret digest, secret length, authorization policy, status (`active`/`frozen`), status reason and change timestamp, timestamps |
+| `secrets` | `id` | JSON document: name, current version, threshold, holders, approvals_required, approval mode and approvers, secret digest, secret length, authorization policy, status (`active`/`frozen`), status reason and change timestamp, timestamps |
 | `shares` | `share_id` | secret, version, holder, coordinate `x`, value `f(x)`, commitment, `distributed_at`, `invalidated_at` |
 | `approvals` | `(secret_id, version, approver)` | `created_at`, `consumed_at` |
+| `secret_roles` | `(secret_id, version)` | holders and approvers snapshots of every version since the role model |
 | `audit_events` | `(secret_id, sequence)` | type, canonical payload, `occurred_at`, `previous_hash`, `hash` |
 | `idempotency` | `key` | operation name, stored response |
+
+Records written before the role model existed are read as `legacy` secrets
+whose approvers are their holders, and their backups synthesize the missing
+role snapshots the same way, so clients that never use `approvers` observe no
+change.
 
 Issuance, distribution, approval, reconstruction, rotation and freeze or
 unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
@@ -499,7 +541,7 @@ Errors use this shape:
 
 | Code | Status | Meaning |
 | --- | --- | --- |
-| `validation_error` | 400 | missing or unknown field, malformed body, bad identifier, policy violation, unregistered holder or approver |
+| `validation_error` | 400 | missing or unknown field, malformed body, bad identifier, policy violation, unregistered holder or approver, invalid approver roster or approval quota |
 | `share_mismatch` | 400 | a submitted share value does not match the commitment stored at issuance |
 | `not_found` | 404 | unknown secret, unknown share, share of another secret, unknown route |
 | `conflict` | 409 | duplicate secret id, or an idempotency key reused for another operation |

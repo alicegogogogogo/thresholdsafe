@@ -276,6 +276,267 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"reason": "x"}, "rotate-1")
         self.assert_code("validation_error", self.service.rotate, "prod-db-root", {"threshold": 1}, "rotate-2")
 
+    # -------------------------------------------------------------- approval roles
+    APPROVERS = ["ops-lead", "security-officer", "compliance"]
+
+    def separated(self, key="create-1", **overrides):
+        body = {"approvers": list(self.APPROVERS)}
+        body.update(overrides)
+        return self.create(key=key, **body)
+
+    def test_legacy_creation_is_the_default_mode(self):
+        record = self.create()
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(HOLDERS, record["approvers"])
+        self.assertEqual(record, self.service.get_secret("prod-db-root"))
+
+    def test_separated_creation_registers_a_distinct_approver_roster(self):
+        record = self.separated()
+        self.assertEqual("separated", record["approval_mode"])
+        self.assertEqual(self.APPROVERS, record["approvers"])
+        self.assertEqual(HOLDERS, record["holders"])
+        self.assertEqual(5, record["share_count"])
+        self.assertEqual(record, self.service.get_secret("prod-db-root"))
+
+    def test_separated_creation_validates_the_roles(self):
+        cases = [
+            ({"approvers": ["alice", "ops-lead"]}, "must not overlap"),
+            ({"approvers": ["ops-lead"]}, "at least two"),
+            ({"approvers": ["ops-lead", "ops-lead"]}, "must not repeat"),
+            ({"approvers": []}, "non-empty array"),
+            ({"approvers": "ops-lead"}, "non-empty array"),
+            ({"approvers": ["ops lead", "compliance"]}, "must start with a letter or digit"),
+            ({"approvals_required": 1}, "between 2 and the number of approvers"),
+            ({"approvals_required": 4}, "between 2 and the number of approvers"),
+        ]
+        for index, (overrides, message) in enumerate(cases):
+            body = create_body(approvers=list(self.APPROVERS))
+            body.update(overrides)
+            with self.assertRaisesRegex(ThresholdSafeError, message):
+                self.service.create_secret(body, f"case-{index}")
+        self.assert_code("not_found", self.service.get_secret, "prod-db-root")
+
+    def test_separated_approvals_come_from_approvers_not_holders(self):
+        self.separated()
+        record_approval = self.service.record_approval
+        self.assert_code("validation_error", record_approval, "prod-db-root", {"approver": "alice"}, "k1")
+        self.assert_code("validation_error", record_approval, "prod-db-root", {"approver": "mallory"}, "k2")
+        first = self.approve(["ops-lead"])[0]
+        self.assertEqual((1, 2, False), (first["approvals"], first["required"], first["satisfied"]))
+        self.assert_code("duplicate_approval", record_approval, "prod-db-root", {"approver": "ops-lead"}, "k3")
+        self.assertTrue(self.approve(["security-officer"], key_prefix="second")[0]["satisfied"])
+
+    def test_separated_reconstruction_combines_holder_shares_and_approver_approvals(self):
+        self.separated()
+        # Shares are still issued to holders only, never to approvers.
+        self.assert_code(
+            "validation_error", self.service.distribute_share, "prod-db-root", {"holder": "ops-lead"}, "share-ops"
+        )
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["ops-lead", "compliance"])
+        result = self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+        self.assertEqual(["alice", "bob", "carol"], result["holders"])
+        self.assertEqual(0, self.service.get_secret("prod-db-root")["approvals"]["recorded"])
+
+    def test_separated_rotation_keeps_the_approver_roster_by_default(self):
+        self.separated()
+        self.approve(["ops-lead", "security-officer"])
+        record = self.service.rotate(
+            "prod-db-root", {"threshold": 2, "holders": ["frank", "grace", "heidi"]}, "rotate-1"
+        )
+        self.assertEqual("separated", record["approval_mode"])
+        self.assertEqual(self.APPROVERS, record["approvers"])
+        self.assertEqual(["frank", "grace", "heidi"], record["holders"])
+        # Neither old nor new holders can approve; the retained approvers can.
+        self.assert_code(
+            "validation_error", self.service.record_approval, "prod-db-root", {"approver": "frank"}, "k1"
+        )
+        self.approve(["ops-lead", "compliance"], key_prefix="v2")
+        issued = self.distribute(["frank", "grace"], key_prefix="v2-share")
+        result = self.reconstruct(issued, ["frank", "grace"], "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_rotation_switches_modes_with_an_explicit_array_or_null(self):
+        self.create()
+        self.approve(["alice", "bob"])
+        record = self.service.rotate(
+            "prod-db-root", {"approvers": ["ops-lead", "security-officer"]}, "rotate-1"
+        )
+        self.assertEqual("separated", record["approval_mode"])
+        self.assertEqual(["ops-lead", "security-officer"], record["approvers"])
+        self.assert_code(
+            "validation_error", self.service.record_approval, "prod-db-root", {"approver": "alice"}, "k1"
+        )
+        self.approve(["ops-lead", "security-officer"], key_prefix="v2")
+        record = self.service.rotate("prod-db-root", {"approvers": None}, "rotate-2")
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(HOLDERS, record["approvers"])
+        self.assert_code(
+            "validation_error", self.service.record_approval, "prod-db-root", {"approver": "ops-lead"}, "k2"
+        )
+        self.assertTrue(self.approve(["alice", "bob"], key_prefix="v3"))
+
+    def test_legacy_rotation_follows_the_final_holders(self):
+        self.create()
+        self.approve(["alice", "bob"])
+        record = self.service.rotate(
+            "prod-db-root", {"threshold": 2, "holders": ["frank", "grace", "heidi"]}, "rotate-1"
+        )
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(["frank", "grace", "heidi"], record["approvers"])
+        self.assert_code(
+            "validation_error", self.service.record_approval, "prod-db-root", {"approver": "alice"}, "k1"
+        )
+        self.assertTrue(self.approve(["frank", "heidi"], key_prefix="v2"))
+
+    def test_rotation_role_validation_happens_before_any_mutation(self):
+        self.separated()
+        self.approve(["ops-lead", "security-officer"])
+        before = self.service.get_secret("prod-db-root")
+        before_audit = self.service.audit("prod-db-root")
+        cases = [
+            ({"approvers": ["alice", "mallory"]}, "r1"),                       # overlaps the holders
+            ({"approvers": ["only-one"]}, "r2"),                               # fewer than two approvers
+            ({"approvers": ["x1", "x2"], "approvals_required": 3}, "r3"),      # quota above the roster
+            ({"approvals_required": 1}, "r4"),                                 # quota below two
+            ({"approvers": None, "approvals_required": 6}, "r5"),              # legacy quota above holders
+        ]
+        for body, key in cases:
+            self.assert_code("validation_error", self.service.rotate, "prod-db-root", body, key)
+        after = self.service.get_secret("prod-db-root")
+        self.assertEqual(before, after)
+        self.assertEqual(2, after["approvals"]["recorded"])  # nothing was consumed
+        self.assertEqual(before_audit, self.service.audit("prod-db-root"))
+
+    def test_rotation_is_authorized_by_the_old_versions_approvers(self):
+        self.separated()
+        self.assert_code("insufficient_approvals", self.service.rotate, "prod-db-root", {}, "rotate-1")
+        self.approve(["ops-lead", "security-officer"])
+        record = self.service.rotate(
+            "prod-db-root", {"approvers": ["new-lead", "new-officer"]}, "rotate-2"
+        )
+        self.assertEqual((2, 0), (record["version"], record["approvals"]["recorded"]))
+        # The old roster spent its approvals and no longer approves.
+        self.assert_code(
+            "validation_error", self.service.record_approval, "prod-db-root", {"approver": "ops-lead"}, "k1"
+        )
+        self.approve(["new-lead", "new-officer"], key_prefix="v2")
+        issued = self.distribute(["alice", "bob", "carol"], key_prefix="v2-share")
+        self.assertEqual(SECRET, self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")["secret"])
+
+    def test_role_information_is_audited_on_creation_approval_and_rotation(self):
+        self.separated()
+        self.approve(["ops-lead", "security-officer"])
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        run = self.service.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        events = {event["type"]: event["payload"] for event in run["events"]}
+        self.assertEqual("separated", events["secret_created"]["approval_mode"])
+        self.assertEqual(self.APPROVERS, events["secret_created"]["approvers"])
+        self.assertEqual("separated", events["approval_recorded"]["approval_mode"])
+        self.assertEqual(self.APPROVERS, events["approval_recorded"]["approvers"])
+        self.assertEqual("separated", events["secret_rotated"]["approval_mode"])
+        self.assertEqual(self.APPROVERS, events["secret_rotated"]["approvers"])
+
+    def test_backup_v3_carries_a_role_snapshot_per_version(self):
+        self.separated()
+        self.approve(["ops-lead", "security-officer"])
+        self.service.rotate(
+            "prod-db-root",
+            {"threshold": 2, "holders": ["frank", "grace", "heidi"],
+             "approvers": ["new-lead", "new-officer", "new-clerk"]},
+            "rotate-1",
+        )
+        backup = self.service.export_backup("prod-db-root")
+        self.assertEqual("thresholdsafe-backup-v3", backup["backup_version"])
+        self.assertEqual(
+            [
+                {"version": 1, "holders": HOLDERS, "approvers": self.APPROVERS},
+                {"version": 2, "holders": ["frank", "grace", "heidi"],
+                 "approvers": ["new-lead", "new-officer", "new-clerk"]},
+            ],
+            backup["roles"],
+        )
+        self.assertEqual("separated", backup["secret"]["approval_mode"])
+        self.assertEqual(["new-lead", "new-officer", "new-clerk"], backup["secret"]["approvers"])
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
+    @staticmethod
+    def restamp(backup):
+        unsigned = {key: value for key, value in backup.items() if key != "checksum"}
+        encoded = json.dumps(unsigned, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+        backup["checksum"] = hashlib.sha256(encoded.encode()).hexdigest()
+        return backup
+
+    def test_verify_v3_checks_role_membership_and_continuity(self):
+        self.separated()
+        self.approve(["ops-lead", "security-officer"])
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        backup = self.service.export_backup("prod-db-root")
+        tampers = [
+            lambda b: b["roles"][0].update(approvers=["mallory", "impostor"]),  # approvals lose their role
+            lambda b: b["roles"][0].update(holders=["alice", "bob"]),           # shares lose their role
+            lambda b: b["roles"].pop(0),                                        # version 1 snapshot missing
+            lambda b: b["roles"][0].update(version=3),                          # continuity broken
+            lambda b: b["roles"].append({"version": 3, "holders": ["x"], "approvers": ["y", "z"]}),
+        ]
+        for tamper in tampers:
+            broken = self.restamp(copy.deepcopy(backup))
+            tamper(broken)
+            self.assert_code("backup_integrity", self.service.verify_backup, {"backup": self.restamp(broken)})
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
+    def test_verify_v3_rejects_structurally_bad_roles(self):
+        self.separated()
+        backup = self.service.export_backup("prod-db-root")
+        for mutate in (
+            lambda b: b.update(roles={}),
+            lambda b: b.update(roles=[]),
+            lambda b: b["roles"][0].pop("holders"),
+            lambda b: b["roles"][0].update(extra=1),
+            lambda b: b["roles"][0].update(holders="alice"),
+            lambda b: b["roles"][0].update(approvers=["ops-lead", "ops-lead"]),
+            lambda b: b["roles"][0].update(version=0),
+        ):
+            broken = copy.deepcopy(backup)
+            mutate(broken)
+            self.assert_code("validation_error", self.service.verify_backup, {"backup": broken})
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
+    def test_pre_role_records_are_read_as_legacy(self):
+        self.create()
+        # Scrub the role fields to mimic a database written before roles existed.
+        row = self.service.store.connection.execute(
+            "SELECT document FROM secrets WHERE id = ?", ("prod-db-root",)
+        ).fetchone()
+        document = json.loads(row["document"])
+        document.pop("approval_mode")
+        document.pop("approvers")
+        self.service.store.connection.execute(
+            "UPDATE secrets SET document = ? WHERE id = ?", (json.dumps(document), "prod-db-root")
+        )
+        self.service.store.connection.execute("DELETE FROM secret_roles WHERE secret_id = ?", ("prod-db-root",))
+
+        record = self.service.get_secret("prod-db-root")
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(HOLDERS, record["approvers"])
+        self.approve(["alice", "bob"])
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.assertEqual(SECRET, self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")["secret"])
+        # Rotation still works and the export synthesizes the missing snapshot.
+        self.approve(["alice", "bob"], key_prefix="again")
+        self.service.rotate("prod-db-root", {}, "rotate-1")
+        backup = self.service.export_backup("prod-db-root")
+        self.assertEqual(
+            [
+                {"version": 1, "holders": HOLDERS, "approvers": HOLDERS},
+                {"version": 2, "holders": HOLDERS, "approvers": HOLDERS},
+            ],
+            backup["roles"],
+        )
+        self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
+
     # ---------------------------------------------------------- freeze lifecycle
     def test_new_secret_starts_active_without_a_reason(self):
         record = self.create()
@@ -625,13 +886,17 @@ class ThresholdSafeTests(unittest.TestCase):
         backup = self.service.export_backup("prod-db-root")
         self.assertEqual(
             {"backup_version", "generated_at", "authorization_policy", "secret",
-             "shares", "approvals", "audit_events", "checksum"},
+             "shares", "approvals", "roles", "audit_events", "checksum"},
             set(backup),
         )
-        self.assertEqual("thresholdsafe-backup-v2", backup["backup_version"])
+        self.assertEqual("thresholdsafe-backup-v3", backup["backup_version"])
         self.assertIsNone(backup["authorization_policy"])
         self.assertTrue(backup["generated_at"].endswith("Z"))
         self.assertNotIn(SECRET, json.dumps(backup))
+        self.assertEqual(
+            [{"version": 1, "holders": HOLDERS, "approvers": HOLDERS}],
+            backup["roles"],
+        )
         secret = backup["secret"]
         self.assertEqual(len(SECRET.encode()), secret["secret_length"])
         self.assertRegex(secret["secret_digest"], r"^[0-9a-f]{64}$")
@@ -709,15 +974,21 @@ class ThresholdSafeTests(unittest.TestCase):
         for mutate in (
             lambda b: b.pop("shares"),
             lambda b: b.pop("authorization_policy"),
+            lambda b: b.pop("roles"),
             lambda b: b.update(unexpected=True),
             lambda b: b.update(backup_version="thresholdsafe-backup-v1"),
-            lambda b: b.update(backup_version="thresholdsafe-backup-v3"),
+            lambda b: b.update(backup_version="thresholdsafe-backup-v2"),
+            lambda b: b.update(backup_version="thresholdsafe-backup-v4"),
             lambda b: b.update(authorization_policy={"all": []}),
             lambda b: b.update(generated_at=None),
             lambda b: b["secret"].update(version="1"),
             lambda b: b["secret"].pop("secret_digest"),
+            lambda b: b["secret"].update(approval_mode="hybrid"),
             lambda b: b["shares"][0].update(coordinate="1"),
             lambda b: b["approvals"].append({"secret_id": "prod-db-root"}),
+            lambda b: b["roles"][0].pop("approvers"),
+            lambda b: b["roles"][0].update(version="1"),
+            lambda b: b["roles"][0].update(holders=[]),
             lambda b: b["audit_events"][0].update(sequence="1"),
         ):
             broken = copy.deepcopy(backup)
@@ -940,29 +1211,50 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assertIn("authorization_denied", types)
         self.assertNotIn("reconstruction_failed", types)
 
-    # -------------------------------------------------------------- backup v2
+    # -------------------------------------------------------------- backup v3
     def test_backup_carries_the_authorization_policy(self):
         policy = {"any": [self.RECONSTRUCT_ONLY, self.EXTRA_SHARES]}
         self.create(policy=policy)
         backup = self.service.export_backup("prod-db-root")
-        self.assertEqual("thresholdsafe-backup-v2", backup["backup_version"])
+        self.assertEqual("thresholdsafe-backup-v3", backup["backup_version"])
         self.assertEqual(policy, backup["authorization_policy"])
         self.assertNotIn("policy", backup["secret"])
         self.assertTrue(self.service.verify_backup({"backup": backup})["valid"])
 
-    def test_verify_still_accepts_v1_backups(self):
+    def test_verify_still_accepts_v1_and_v2_backups(self):
         self.create()
         backup = self.service.export_backup("prod-db-root")
-        v1 = {key: value for key, value in backup.items() if key != "authorization_policy"}
-        v1["backup_version"] = "thresholdsafe-backup-v1"
-        v1["checksum"] = hashlib.sha256(
-            json.dumps({k: v for k, v in v1.items() if k != "checksum"},
-                       ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
-        ).hexdigest()
-        self.assertTrue(self.service.verify_backup({"backup": v1})["valid"])
+
+        def downgrade(version):
+            # Older formats carry neither roles nor the secret's role fields.
+            fields = {"thresholdsafe-backup-v1": set(), "thresholdsafe-backup-v2": {"authorization_policy"}}
+            legacy = {
+                key: value
+                for key, value in backup.items()
+                if key in {"backup_version", "generated_at", "secret", "shares", "approvals",
+                           "audit_events", "checksum"} | fields[version]
+            }
+            legacy["backup_version"] = version
+            legacy["secret"] = {
+                key: value for key, value in legacy["secret"].items()
+                if key not in {"approval_mode", "approvers"}
+            }
+            legacy["checksum"] = hashlib.sha256(
+                json.dumps({k: v for k, v in legacy.items() if k != "checksum"},
+                           ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+            ).hexdigest()
+            return legacy
+
+        for version in ("thresholdsafe-backup-v1", "thresholdsafe-backup-v2"):
+            self.assertTrue(self.service.verify_backup({"backup": downgrade(version)})["valid"])
         # A v1 document must not carry the v2 field.
+        v1 = downgrade("thresholdsafe-backup-v1")
         v1["authorization_policy"] = None
         self.assert_code("validation_error", self.service.verify_backup, {"backup": v1})
+        # A v2 document must not carry the v3 roles.
+        v2 = downgrade("thresholdsafe-backup-v2")
+        v2["roles"] = []
+        self.assert_code("validation_error", self.service.verify_backup, {"backup": v2})
 
     def test_verify_v2_rejects_bad_policy_and_checksum(self):
         self.create(policy=self.RECONSTRUCT_ONLY)

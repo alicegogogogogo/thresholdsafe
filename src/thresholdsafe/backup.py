@@ -9,10 +9,15 @@ document without touching any service state: structural problems raise
 :class:`ValidationError`, while a well-formed document whose contents are
 inconsistent raises :class:`BackupIntegrity`.
 
-Two formats are accepted. ``thresholdsafe-backup-v1`` is the original layout
-and is verified unchanged. ``thresholdsafe-backup-v2`` — what new exports
-produce — adds the top-level ``authorization_policy`` field (a policy
-expression or ``null``), which is covered by the checksum.
+Three formats are accepted. ``thresholdsafe-backup-v1`` is the original layout
+and is verified unchanged. ``thresholdsafe-backup-v2`` adds the top-level
+``authorization_policy`` field (a policy expression or ``null``), which is
+covered by the checksum. ``thresholdsafe-backup-v3`` — what new exports
+produce — adds the top-level ``roles`` array: one ``{version, holders,
+approvers}`` snapshot per version from 1 to the current version, so the
+verifier can check that every share and every approval belongs to a role of
+its own version. Versions 1 and 2 predate the role model and are read as
+legacy: their approvers are exactly their holders.
 """
 
 from __future__ import annotations
@@ -28,7 +33,8 @@ from .policy import parse_policy
 
 BACKUP_VERSION_V1 = "thresholdsafe-backup-v1"
 BACKUP_VERSION_V2 = "thresholdsafe-backup-v2"
-BACKUP_VERSION = BACKUP_VERSION_V2
+BACKUP_VERSION_V3 = "thresholdsafe-backup-v3"
+BACKUP_VERSION = BACKUP_VERSION_V3
 ZERO_HASH = "0" * 64
 HEX_HASH = re.compile(r"^[0-9a-f]{64}$")
 SHARE_VALUE = re.compile(r"^[0-9a-f]{1,132}$")
@@ -43,6 +49,7 @@ TOP_LEVEL_FIELDS = {
     "checksum",
 }
 TOP_LEVEL_FIELDS_V2 = TOP_LEVEL_FIELDS | {"authorization_policy"}
+TOP_LEVEL_FIELDS_V3 = TOP_LEVEL_FIELDS_V2 | {"roles"}
 SECRET_FIELDS = {
     "id",
     "name",
@@ -59,6 +66,7 @@ SECRET_FIELDS = {
     "created_at",
     "updated_at",
 }
+SECRET_FIELDS_V3 = SECRET_FIELDS | {"approval_mode", "approvers"}
 SHARE_FIELDS = {
     "share_id",
     "secret_id",
@@ -72,6 +80,7 @@ SHARE_FIELDS = {
 }
 APPROVAL_FIELDS = {"secret_id", "version", "approver", "created_at", "consumed_at"}
 EVENT_FIELDS = {"sequence", "type", "payload", "occurred_at", "previous_hash", "hash"}
+ROLE_FIELDS = {"version", "holders", "approvers"}
 
 
 def encode(value: Any) -> str:
@@ -131,18 +140,26 @@ def _hash_text(value: Any, field: str) -> str:
     return value
 
 
-def _parse_secret(raw: Any) -> dict[str, Any]:
-    secret = _require_object(raw, SECRET_FIELDS, "secret")
+def _identifier_array(value: Any, field: str) -> list[str]:
+    if not isinstance(value, list) or not value or any(not isinstance(item, str) for item in value):
+        raise ValidationError(f"{field} must be a non-empty array of identifiers")
+    if len(set(value)) != len(value):
+        raise ValidationError(f"{field} must not repeat the same identifier")
+    return value
+
+
+def _parse_secret(raw: Any, version: str) -> dict[str, Any]:
+    secret = _require_object(raw, SECRET_FIELDS_V3 if version == BACKUP_VERSION_V3 else SECRET_FIELDS, "secret")
     identifier(secret["id"], "secret id")
     _non_empty_text(secret["name"], "secret name")
     positive_int(secret["version"], "secret version", 1)
     positive_int(secret["threshold"], "secret threshold", 2)
     positive_int(secret["approvals_required"], "secret approvals_required", 1)
-    holders = secret["holders"]
-    if not isinstance(holders, list) or not holders or any(not isinstance(h, str) for h in holders):
-        raise ValidationError("secret holders must be a non-empty array of holder identifiers")
-    if len(set(holders)) != len(holders):
-        raise ValidationError("secret holders must not repeat the same holder")
+    _identifier_array(secret["holders"], "secret holders")
+    if version == BACKUP_VERSION_V3:
+        if secret["approval_mode"] not in ("legacy", "separated"):
+            raise ValidationError("secret approval_mode must be legacy or separated")
+        _identifier_array(secret["approvers"], "secret approvers")
     _hash_text(secret["secret_digest"], "secret_digest")
     positive_int(secret["secret_length"], "secret_length", 1)
     if secret["status"] not in ("active", "frozen"):
@@ -195,6 +212,19 @@ def _parse_event(raw: Any) -> dict[str, Any]:
     return event
 
 
+def _parse_roles(raw: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw, list) or not raw:
+        raise ValidationError("roles must be a non-empty array of role snapshots")
+    roles = []
+    for entry in raw:
+        role = _require_object(entry, ROLE_FIELDS, "role snapshot")
+        positive_int(role["version"], "role version", 1)
+        _identifier_array(role["holders"], "role holders")
+        _identifier_array(role["approvers"], "role approvers")
+        roles.append(role)
+    return roles
+
+
 def _parse(backup: Any) -> dict[str, Any]:
     if not isinstance(backup, dict):
         raise ValidationError("backup must be an object")
@@ -203,12 +233,16 @@ def _parse(backup: Any) -> dict[str, Any]:
         fields = TOP_LEVEL_FIELDS
     elif version == BACKUP_VERSION_V2:
         fields = TOP_LEVEL_FIELDS_V2
+    elif version == BACKUP_VERSION_V3:
+        fields = TOP_LEVEL_FIELDS_V3
     else:
-        raise ValidationError(f"backup_version must be {BACKUP_VERSION_V1} or {BACKUP_VERSION_V2}")
+        raise ValidationError(
+            f"backup_version must be {BACKUP_VERSION_V1}, {BACKUP_VERSION_V2} or {BACKUP_VERSION_V3}"
+        )
     document = _require_object(backup, fields, "backup")
     _non_empty_text(document["generated_at"], "generated_at")
     _hash_text(document["checksum"], "checksum")
-    if version == BACKUP_VERSION_V2 and document["authorization_policy"] is not None:
+    if version != BACKUP_VERSION_V1 and document["authorization_policy"] is not None:
         parse_policy(document["authorization_policy"])
     shares = document["shares"]
     if not isinstance(shares, list):
@@ -221,10 +255,12 @@ def _parse(backup: Any) -> dict[str, Any]:
         raise ValidationError("audit_events must be an array")
     return {
         "raw": document,
-        "secret": _parse_secret(document["secret"]),
+        "version": version,
+        "secret": _parse_secret(document["secret"], version),
         "shares": [_parse_share(entry) for entry in shares],
         "approvals": [_parse_approval(entry) for entry in approvals],
         "audit_events": [_parse_event(entry) for entry in events],
+        "roles": _parse_roles(document["roles"]) if version == BACKUP_VERSION_V3 else None,
     }
 
 
@@ -256,6 +292,24 @@ def _check_integrity(parsed: dict[str, Any]) -> None:
     for share in shares:
         roster.setdefault(share["version"], set()).add(share["holder"])
 
+    roles = parsed["roles"]
+    approvers_of: dict[int, set[str]] = {}
+    if roles is not None:
+        # v3: the snapshots must run continuously from version 1 to the
+        # current version, and shares and approvals must belong to a role of
+        # their own version.
+        if [role["version"] for role in roles] != list(range(1, current + 1)):
+            raise BackupIntegrity("role snapshots do not cover every version from 1 to the current version")
+        by_version = {role["version"]: role for role in roles}
+        for share_version, holders in roster.items():
+            if sorted(by_version[share_version]["holders"]) != sorted(holders):
+                raise BackupIntegrity(f"shares do not match the holders snapshot of version {share_version}")
+        approvers_of = {role["version"]: set(role["approvers"]) for role in roles}
+    else:
+        # v1/v2 predate the role model and are read as legacy: the approvers
+        # of a version are exactly its holders.
+        approvers_of = {share_version: set(holders) for share_version, holders in roster.items()}
+
     for approval in parsed["approvals"]:
         if approval["secret_id"] != secret_id:
             raise BackupIntegrity(f"approval by {approval['approver']} does not belong to secret {secret_id}")
@@ -263,9 +317,9 @@ def _check_integrity(parsed: dict[str, Any]) -> None:
             raise BackupIntegrity(
                 f"approval by {approval['approver']} targets a version outside 1..{current}"
             )
-        if approval["approver"] not in roster[approval["version"]]:
+        if approval["approver"] not in approvers_of[approval["version"]]:
             raise BackupIntegrity(
-                f"approver {approval['approver']} is not a holder of version {approval['version']}"
+                f"approver {approval['approver']} is not an approver of version {approval['version']}"
             )
 
     previous = ZERO_HASH
