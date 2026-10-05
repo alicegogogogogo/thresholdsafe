@@ -781,6 +781,230 @@ class ThresholdSafeTests(unittest.TestCase):
         ).hexdigest()
         self.assert_code("backup_integrity", self.service.verify_backup, {"backup": broken})
 
+    # ------------------------------------------------------------------ restore
+    def target(self, name="restored.db"):
+        return ThresholdSafe(str(Path(self.directory.name) / name))
+
+    @staticmethod
+    def restamp(document):
+        unsigned = {key: value for key, value in document.items() if key != "checksum"}
+        document["checksum"] = hashlib.sha256(
+            json.dumps(unsigned, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode()
+        ).hexdigest()
+        return document
+
+    def test_restore_rebuilds_the_custody_state(self):
+        self.create()
+        self.distribute(["alice", "bob"])
+        self.approve(["alice", "bob"])
+        backup = self.service.export_backup("prod-db-root")
+        source_record = self.service.get_secret("prod-db-root")
+
+        target = self.target()
+        response = target.restore_backup({"backup": backup}, "restore-1")
+        self.assertTrue(response["restored"])
+        self.assertEqual(source_record, response["secret"])
+        self.assertEqual(source_record, target.get_secret("prod-db-root"))
+        self.assertEqual({"shares": 5, "approvals": 2, "audit_events": 5}, response["imported"])
+
+        run = target.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        self.assertEqual(6, len(run["events"]))
+        restored = run["events"][-1]
+        self.assertEqual("backup_restored", restored["type"])
+        self.assertEqual(6, restored["sequence"])
+        self.assertEqual({
+            "backup_version": "thresholdsafe-backup-v3",
+            "checksum": backup["checksum"],
+            "previous_head_hash": backup["audit_events"][-1]["hash"],
+            "imported_shares": 5,
+            "imported_approvals": 2,
+            "imported_events": 5,
+        }, restored["payload"])
+        # The restore event is part of the chain a later export carries.
+        exported = target.export_backup("prod-db-root")
+        self.assertEqual("backup_restored", exported["audit_events"][-1]["type"])
+        self.assertEqual(6, len(exported["audit_events"]))
+        self.assertTrue(target.verify_backup({"backup": exported})["valid"])
+
+    def test_restore_recovers_a_usable_secret(self):
+        self.create()
+        self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        backup = self.service.export_backup("prod-db-root")
+
+        target = self.target()
+        target.restore_backup({"backup": backup}, "restore-1")
+        shares = {share["holder"]: share for share in backup["shares"]}
+        claims = [{"share_id": shares[h]["share_id"], "value": shares[h]["value"]}
+                  for h in ("alice", "bob", "carol")]
+        result = target.reconstruct("prod-db-root", {"shares": claims}, "reconstruct-1")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_restore_preserves_rotation_history_and_marks(self):
+        self.create()
+        self.distribute(["alice"])
+        self.approve(["alice", "bob"])
+        self.service.rotate("prod-db-root", {"threshold": 2}, "rotate-1")
+        backup = self.service.export_backup("prod-db-root")
+
+        target = self.target()
+        response = target.restore_backup({"backup": backup}, "restore-1")
+        record = response["secret"]
+        self.assertEqual(2, record["version"])
+        self.assertEqual(2, record["threshold"])
+        self.assertEqual({"shares": 10, "approvals": 2, "audit_events": 6}, response["imported"])
+        states = {share["share_id"]: share for share in target.export_backup("prod-db-root")["shares"]}
+        self.assertIsNotNone(states["prod-db-root.v1.alice"]["distributed_at"])
+        self.assertIsNotNone(states["prod-db-root.v1.alice"]["invalidated_at"])
+        self.assertIsNone(states["prod-db-root.v2.alice"]["distributed_at"])
+        self.assertIsNone(states["prod-db-root.v2.alice"]["invalidated_at"])
+
+    def test_restore_rejects_malformed_requests_without_touching_state(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        self.assert_code("validation_error", target.restore_backup, {}, "restore-1")
+        self.assert_code("validation_error", target.restore_backup, {"backup": backup, "extra": 1}, "restore-1")
+        self.assert_code("validation_error", target.restore_backup, {"backup": "not-an-object"}, "restore-1")
+        self.assert_code("validation_error", target.restore_backup, {"backup": backup}, None)
+        unsupported = self.restamp(dict(backup, backup_version="thresholdsafe-backup-v4"))
+        self.assert_code("validation_error", target.restore_backup, {"backup": unsupported}, "restore-1")
+        self.assert_code("not_found", target.get_secret, "prod-db-root")
+        for table in ("shares", "approvals", "audit_events", "idempotency"):
+            row = target.store.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+            self.assertEqual(0, row["n"])
+
+    def test_restore_rejects_tampered_backups_and_leaves_nothing(self):
+        self.create()
+        self.distribute(["alice"])
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+
+        bad_checksum = dict(backup, checksum="0" * 64)
+        self.assert_code("backup_integrity", target.restore_backup, {"backup": bad_checksum}, "restore-1")
+        tampered = copy.deepcopy(backup)
+        tampered["shares"][0]["commitment"] = "1" * 64
+        self.assert_code(
+            "backup_integrity", target.restore_backup, {"backup": self.restamp(tampered)}, "restore-2"
+        )
+        self.assert_code("not_found", target.get_secret, "prod-db-root")
+        for table in ("shares", "approvals", "audit_events", "idempotency"):
+            row = target.store.connection.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
+            self.assertEqual(0, row["n"])
+
+    def test_restore_conflicts_with_an_existing_secret(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        before = self.service.audit("prod-db-root")
+        self.assert_code("conflict", self.service.restore_backup, {"backup": backup}, "restore-1")
+        self.assertEqual(before, self.service.audit("prod-db-root"))
+        row = self.service.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM idempotency WHERE key = 'restore-1'"
+        ).fetchone()
+        self.assertEqual(0, row["n"])
+
+    def test_restore_is_idempotent_and_the_key_is_single_use(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        first = target.restore_backup({"backup": backup}, "restore-1")
+        self.assertEqual(first, target.restore_backup({"backup": backup}, "restore-1"))
+        # The replay imported nothing twice.
+        self.assertEqual(2, len(target.audit("prod-db-root")["events"]))
+        row = target.store.connection.execute("SELECT COUNT(*) AS n FROM idempotency").fetchone()
+        self.assertEqual(1, row["n"])
+        # The same key with any other backup conflicts.
+        self.service.create_secret(create_body(id="other-secret"), "create-2")
+        other = self.service.export_backup("other-secret")
+        self.assert_code("conflict", target.restore_backup, {"backup": other}, "restore-1")
+        self.assert_code("not_found", target.get_secret, "other-secret")
+
+    def test_restore_preserves_the_frozen_state(self):
+        self.create()
+        self.freeze()
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        record = target.restore_backup({"backup": backup}, "restore-1")["secret"]
+        self.assertEqual("frozen", record["status"])
+        self.assertEqual("security incident under investigation", record["status_reason"])
+        self.assert_code(
+            "secret_frozen", target.distribute_share, "prod-db-root", {"holder": "alice"}, "share-alice"
+        )
+
+    def test_restore_reads_v1_and_v2_as_legacy(self):
+        self.create(policy=self.RECONSTRUCT_ONLY)
+        backup = self.service.export_backup("prod-db-root")
+
+        v1 = {key: value for key, value in backup.items() if key not in ("authorization_policy", "versions")}
+        v1["backup_version"] = "thresholdsafe-backup-v1"
+        target_v1 = self.target("restored-v1.db")
+        record = target_v1.restore_backup({"backup": self.restamp(v1)}, "restore-1")["secret"]
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(HOLDERS, record["approvers"])
+        self.assertEqual({"policy": None}, target_v1.get_policy("prod-db-root"))
+
+        v2 = {key: value for key, value in backup.items() if key != "versions"}
+        v2["backup_version"] = "thresholdsafe-backup-v2"
+        target_v2 = self.target("restored-v2.db")
+        record = target_v2.restore_backup({"backup": self.restamp(v2)}, "restore-1")["secret"]
+        self.assertEqual("legacy", record["approval_mode"])
+        self.assertEqual(HOLDERS, record["approvers"])
+        self.assertEqual({"policy": self.RECONSTRUCT_ONLY}, target_v2.get_policy("prod-db-root"))
+
+    def test_restore_preserves_separated_roles(self):
+        self.create_separated()
+        self.approve(["nina"])
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        record = target.restore_backup({"backup": backup}, "restore-1")["secret"]
+        self.assertEqual("separated", record["approval_mode"])
+        self.assertEqual(self.APPROVERS, record["approvers"])
+        self.assertEqual({"recorded": 1, "required": 2, "satisfied": False}, record["approvals"])
+        self.assert_code(
+            "validation_error", target.record_approval, "prod-db-root", {"approver": "alice"}, "approval-1"
+        )
+        recorded = target.record_approval("prod-db-root", {"approver": "oscar"}, "approval-2")
+        self.assertTrue(recorded["satisfied"])
+
+    def test_restore_keeps_the_target_receipt_key(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        key_before = target.receipt_key()
+        target.restore_backup({"backup": backup}, "restore-1")
+        self.assertEqual(key_before, target.receipt_key())
+        receipt = target.issue_receipt("prod-db-root", {"sequence": 1, "nonce": "n-1"}, "receipt-1")
+        self.assertEqual(key_before["key_id"], receipt["key_id"])
+        verified = target.verify_receipt({"receipt": receipt, "public_key": key_before["public_key"]})
+        self.assertEqual({"valid": True}, verified)
+
+    def test_concurrent_restore_admits_a_single_winner(self):
+        import threading
+
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        target = self.target()
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def restore(index: int) -> None:
+            try:
+                results.append(target.restore_backup({"backup": backup}, f"restore-{index}"))
+            except Exception as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=restore, args=(index,)) for index in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, len(results))
+        self.assertEqual(5, len(errors))
+        self.assertTrue(all(isinstance(error, ThresholdSafeError) for error in errors))
+        self.assertEqual(["conflict"] * 5, sorted(error.code for error in errors))
+        self.assertEqual(2, len(target.audit("prod-db-root")["events"]))
+
     # ------------------------------------------------------------- authorization policy
     RECONSTRUCT_ONLY = {"fact": {"fact": "action", "op": "eq", "value": "reconstruct"}}
     EXTRA_SHARES = {"fact": {"fact": "presented_shares", "op": "gte", "value": 4}}

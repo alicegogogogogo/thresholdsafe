@@ -45,7 +45,7 @@ The initial release supports a compact public contract:
   verify independently against the service's published public key;
 - a secret can be exported as a self-contained, checksummed JSON backup, and
   any backup document can be verified independently without touching service
-  state;
+  state, or restored into a fresh or existing database as a new secret;
 - the plaintext secret is never written to the database: only its SHA-256
   commitment and byte length are kept, to verify what reconstruction recovers.
 
@@ -581,6 +581,52 @@ verification never partially accepts. A valid backup returns HTTP 200:
 {"valid":true,"secret_id":"prod-db-root","version":1,"share_count":5,"approval_count":2,"event_count":8}
 ```
 
+### Restore a backup
+
+```http
+POST /backups/restore
+Idempotency-Key: demo-restore
+Content-Type: application/json
+
+{"backup": { ...exported document... }}
+```
+
+Rebuilds the custody state of one secret from a backup document. The body
+must contain exactly `backup` and an `Idempotency-Key` is required. The
+document is first checked against the same contract `POST /backups/verify`
+applies: a malformed document or an unsupported `backup_version` is
+`400 validation_error`, and a well-formed document whose checksum, secret
+ownership, version continuity, role attribution, share commitments or audit
+chain is inconsistent is `409 backup_integrity`. A secret with the same id
+already present in the target database is `409 conflict`.
+
+On success the secret record, every share of every version, all approvals
+and the original audit chain are written in one transaction — preserving
+the current version, threshold, holders, approval mode, authorization
+policy, frozen status, status reason, every timestamp, the distribution and
+invalidation marks of each share and the consumption state of each
+approval — and a `backup_restored` event is appended to the imported chain.
+Its payload carries `backup_version`, the backup `checksum`, the
+`previous_head_hash` of the imported chain and the imported counts, so
+later audit reads and re-exported backups cover the restore. v1 and v2
+documents restore in the legacy approval mode (a version's approvers are
+its holders), with a `null` policy for v1; v3 documents restore the
+per-version role snapshots they carry. A secret restored in the frozen
+state is frozen immediately. A backup contains no receipt-signing key, so
+the restore never replaces the target database's own key: receipts issued
+afterwards are signed with the target key. The response is HTTP 201:
+
+```json
+{"restored":true,"secret":{"id":"prod-db-root", ...standard custody record... },"imported":{"shares":5,"approvals":2,"audit_events":8}}
+```
+
+Every failure is atomic: a rejected restore leaves no partial data, no
+`backup_restored` event and no idempotency record. Repeating the same
+request with the same `Idempotency-Key` replays the first successful
+response without importing again; reusing the key with a different backup
+is `409 conflict`. Concurrent restores of the same secret linearize, so
+exactly one of them succeeds.
+
 ## Data model
 
 | Table | Key | Contents |
@@ -592,8 +638,9 @@ verification never partially accepts. A valid backup returns HTTP 200:
 | `idempotency` | `key` | operation name, stored response |
 | `receipt_keys` | singleton row | the Ed25519 receipt-signing key (private half included — it never leaves the database), public key, `key_id`, creation timestamp |
 
-Issuance, distribution, approval, reconstruction, rotation and freeze or
-unfreeze each run inside one `BEGIN IMMEDIATE` transaction, so a rejected
+Issuance, distribution, approval, reconstruction, rotation, freeze or
+unfreeze and backup restore each run inside one `BEGIN IMMEDIATE`
+transaction, so a rejected
 request leaves no partial state and every request observes a complete
 pre- or post-transition snapshot. A write rejected because the secret is
 frozen commits in that same transaction only its `operation_blocked` event,

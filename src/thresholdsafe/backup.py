@@ -345,14 +345,20 @@ def _check_integrity(parsed: dict[str, Any]) -> None:
         previous = event["hash"]
 
 
-def verify(backup: Any) -> dict[str, Any]:
-    """Validate a backup document and return a summary of its contents.
+def validate(backup: Any) -> dict[str, Any]:
+    """Validate a backup document and return its parsed contents.
 
     Pure: nothing is read from or written to any service state, and the
     document is either accepted as a whole or rejected as a whole.
     """
     parsed = _parse(backup)
     _check_integrity(parsed)
+    return parsed
+
+
+def verify(backup: Any) -> dict[str, Any]:
+    """Validate a backup document and return a summary of its contents."""
+    parsed = validate(backup)
     secret = parsed["secret"]
     return {
         "valid": True,

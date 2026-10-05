@@ -11,6 +11,7 @@ from .backup import (
     event_hash as _event_hash,
     share_commitment as _share_commitment,
     stamp as _stamp,
+    validate as _validate_backup,
     verify as _verify,
 )
 from .errors import (
@@ -555,6 +556,94 @@ class ThresholdSafe:
         if not isinstance(raw, dict) or set(raw) != {"backup"}:
             raise ValidationError("backup verification body must contain exactly backup")
         return _verify(raw["backup"])
+
+    def restore_backup(self, raw: Any, key: str | None) -> dict[str, Any]:
+        """Restore a verified backup into this database as a new secret.
+
+        The document is fully validated against the backup contract first —
+        exactly the checks ``verify_backup`` performs — then the secret
+        record, every share of every version, all approvals and the original
+        audit chain are imported in one transaction, and a ``backup_restored``
+        event extends the imported chain. A backup carries no receipt-signing
+        key, so the restore never touches ``receipt_keys``: receipts issued
+        afterwards are signed with this database's own key. A secret restored
+        in the frozen state is frozen immediately.
+        """
+        if not isinstance(raw, dict) or set(raw) != {"backup"}:
+            raise ValidationError("backup restore body must contain exactly backup")
+        self._require_key(key)
+        parsed = _validate_backup(raw["backup"])
+        document = parsed["raw"]
+        secret = parsed["secret"]
+        secret_id = secret["id"]
+        # The checksum pins the exact document, so an identical request
+        # replays while any other backup with the same key conflicts.
+        operation = f"restore-backup:{secret_id}:{document['checksum']}"
+
+        def restore() -> dict[str, Any]:
+            row = self.store.connection.execute(
+                "SELECT 1 AS present FROM secrets WHERE id = ?", (secret_id,)
+            ).fetchone()
+            if row is not None:
+                raise ConflictError(f"secret {secret_id} already exists")
+            record = dict(secret)
+            record["policy"] = document.get("authorization_policy")
+            versions = parsed["versions"]
+            if versions is not None:
+                # A v3 document pins the role snapshot of every version; the
+                # current entry also fills the top-level role fields. v1/v2
+                # documents carry no role information and restore without
+                # these fields, so the existing legacy fallbacks (a version's
+                # approvers are its holders) keep applying.
+                current = versions[-1]
+                record["approval_mode"] = current["approval_mode"]
+                record["approvers"] = (
+                    list(current["approvers"]) if current["approval_mode"] == "separated" else None
+                )
+                record["versions"] = [dict(entry) for entry in versions]
+            self.store.connection.execute(
+                "INSERT INTO secrets(id, document, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                (secret_id, self.store.encode(record), secret["created_at"], secret["updated_at"]),
+            )
+            for share in parsed["shares"]:
+                self.store.connection.execute(
+                    "INSERT INTO shares(share_id, secret_id, version, holder, coordinate, value, "
+                    "commitment, distributed_at, invalidated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (share["share_id"], share["secret_id"], share["version"], share["holder"],
+                     share["coordinate"], share["value"], share["commitment"],
+                     share["distributed_at"], share["invalidated_at"]),
+                )
+            for approval in parsed["approvals"]:
+                self.store.connection.execute(
+                    "INSERT INTO approvals(secret_id, version, approver, created_at, consumed_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (approval["secret_id"], approval["version"], approval["approver"],
+                     approval["created_at"], approval["consumed_at"]),
+                )
+            for event in parsed["audit_events"]:
+                self.store.connection.execute(
+                    "INSERT INTO audit_events(secret_id, sequence, type, payload, occurred_at, "
+                    "previous_hash, hash) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (secret_id, event["sequence"], event["type"], self.store.encode(event["payload"]),
+                     event["occurred_at"], event["previous_hash"], event["hash"]),
+                )
+            head = parsed["audit_events"][-1]["hash"] if parsed["audit_events"] else ZERO_HASH
+            imported = {
+                "shares": len(parsed["shares"]),
+                "approvals": len(parsed["approvals"]),
+                "audit_events": len(parsed["audit_events"]),
+            }
+            self._append(secret_id, "backup_restored", {
+                "backup_version": document["backup_version"],
+                "checksum": document["checksum"],
+                "previous_head_hash": head,
+                "imported_shares": imported["shares"],
+                "imported_approvals": imported["approvals"],
+                "imported_events": imported["audit_events"],
+            })
+            return {"restored": True, "secret": self._record(secret_id), "imported": imported}
+
+        return self._idempotent(key, operation, restore)
 
     # -------------------------------------------------------------------- audit
     def audit(self, secret_id: str) -> dict[str, Any]:
