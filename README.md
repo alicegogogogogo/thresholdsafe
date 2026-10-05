@@ -581,6 +581,48 @@ verification never partially accepts. A valid backup returns HTTP 200:
 {"valid":true,"secret_id":"prod-db-root","version":1,"share_count":5,"approval_count":2,"event_count":8}
 ```
 
+### Restore a backup
+
+```http
+POST /backups/restore
+Content-Type: application/json
+Idempotency-Key: restore-2024-05-01
+
+{"backup": { ...exported document... }}
+```
+
+Rebuilds the custody state of one secret from a backup into a database —
+fresh or populated — that does not yet hold a secret with that id. The body
+must contain exactly `backup` and an `Idempotency-Key` is required. The
+document is first checked against the full verification contract above
+(pure: a rejected document writes nothing), then the secret record, every
+share of every version, all approvals and the original audit chain are
+imported in a single transaction, and a `backup_restored` event is appended
+to the imported chain. Its payload carries `backup_version`, `checksum`,
+`head_hash` (the head of the imported chain) and the imported counts; later
+audit reads and re-exported backups cover it. The current version, threshold,
+holders, approval mode, authorization policy (null for v1 documents), frozen
+status with its reason and epoch, all timestamps, the shares' distribution
+and invalidation marks and the approvals' consumption state are preserved;
+v1 and v2 documents are restored in legacy mode, v3 keeps its per-version
+role snapshots. A restored frozen secret is immediately subject to the freeze
+rules. Backups contain no receipt-signing key, so the restore never touches
+the database's own receipt key and receipts issued afterwards are signed by
+it. A successful restore returns HTTP 201:
+
+```json
+{"restored":true,"secret":{ ...standard custody record... },"share_count":5,"approval_count":2,"event_count":8}
+```
+
+A malformed body, a missing `Idempotency-Key` or an unsupported
+`backup_version` is `400 validation_error`; a well-formed but inconsistent
+document is `409 backup_integrity`; a secret with the same id already in the
+database is `409 conflict`. No failure leaves partial data, a restore event
+or an idempotency record behind. Replaying the same request with the same
+key returns the first response without importing again, reusing the key with
+a different backup is `409 conflict`, and concurrent restores of the same
+secret let exactly one request succeed.
+
 ## Data model
 
 | Table | Key | Contents |

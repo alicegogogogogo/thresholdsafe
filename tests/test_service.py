@@ -10,6 +10,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 from thresholdsafe import receipts
+from thresholdsafe.backup import stamp
 from thresholdsafe.errors import SecretFrozen, SecretNotFrozen, ThresholdSafeError
 from thresholdsafe.service import ThresholdSafe
 
@@ -1530,6 +1531,246 @@ class ThresholdSafeTests(unittest.TestCase):
         self.assertTrue(run["chain_valid"])
         issued = [e for e in run["events"] if e["type"] == "audit_receipt_issued"]
         self.assertEqual(1, len(issued))
+
+    # -------------------------------------------------------------- restore
+    def second_service(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        return ThresholdSafe(str(Path(directory.name) / "restored.db"))
+
+    @staticmethod
+    def downgrade(backup, version):
+        if version == 1:
+            document = {
+                key: value
+                for key, value in backup.items()
+                if key not in ("authorization_policy", "versions", "checksum")
+            }
+            document["backup_version"] = "thresholdsafe-backup-v1"
+        else:
+            document = {key: value for key, value in backup.items() if key not in ("versions", "checksum")}
+            document["backup_version"] = "thresholdsafe-backup-v2"
+        return stamp(document)
+
+    def test_restore_rebuilds_the_custody_state(self):
+        self.create()
+        issued = self.distribute(["alice", "bob", "carol"])
+        self.approve(["alice", "bob"])
+        self.reconstruct(issued, ["alice", "bob", "carol"], "reconstruct-1")
+        backup = self.service.export_backup("prod-db-root")
+
+        restored = self.second_service()
+        response = restored.restore_backup({"backup": backup}, "restore-1")
+        self.assertTrue(response["restored"])
+        self.assertEqual(5, response["share_count"])
+        self.assertEqual(2, response["approval_count"])
+        self.assertEqual(len(backup["audit_events"]), response["event_count"])
+        # The restored record is the standard custody record, distribution and
+        # consumption marks included.
+        record = restored.get_secret("prod-db-root")
+        self.assertEqual(response["secret"], record)
+        self.assertEqual(self.service.get_secret("prod-db-root"), record)
+        self.assertEqual(3, record["distributed_shares"])
+        self.assertEqual({"recorded": 0, "required": 2, "satisfied": False}, record["approvals"])
+        # The restored secret is fully operational: fresh approvals and the
+        # imported shares reconstruct the original secret.
+        restored.record_approval("prod-db-root", {"approver": "dave"}, "approval-dave")
+        restored.record_approval("prod-db-root", {"approver": "erin"}, "approval-erin")
+        result = restored.reconstruct("prod-db-root", {"shares": self.claims(issued, ["alice", "bob", "carol"])}, "reconstruct-2")
+        self.assertEqual(SECRET, result["secret"])
+
+    def test_restore_appends_a_backup_restored_event_to_the_imported_chain(self):
+        self.create()
+        self.distribute(["alice"])
+        backup = self.service.export_backup("prod-db-root")
+        source_audit = self.service.audit("prod-db-root")
+
+        restored = self.second_service()
+        restored.restore_backup({"backup": backup}, "restore-1")
+        run = restored.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        self.assertEqual(source_audit["events"], run["events"][:-1])
+        event = run["events"][-1]
+        self.assertEqual("backup_restored", event["type"])
+        self.assertEqual(source_audit["head_hash"], event["previous_hash"])
+        self.assertEqual(
+            {
+                "backup_version": "thresholdsafe-backup-v3",
+                "checksum": backup["checksum"],
+                "head_hash": source_audit["head_hash"],
+                "imported_shares": 5,
+                "imported_approvals": 0,
+                "imported_events": len(backup["audit_events"]),
+            },
+            event["payload"],
+        )
+        # A re-exported backup covers the restore event and still verifies.
+        reexported = restored.export_backup("prod-db-root")
+        self.assertEqual(len(backup["audit_events"]) + 1, len(reexported["audit_events"]))
+        self.assertEqual("backup_restored", reexported["audit_events"][-1]["type"])
+        self.assertTrue(self.service.verify_backup({"backup": reexported})["valid"])
+
+    def test_restore_preserves_separated_roles_and_rotation_marks(self):
+        self.create_separated()
+        self.approve(["nina", "oscar"])
+        self.service.rotate(
+            "prod-db-root", {"holders": ["alice", "bob", "carol"], "threshold": 2}, "rotate-1"
+        )
+        backup = self.service.export_backup("prod-db-root")
+
+        restored = self.second_service()
+        response = restored.restore_backup({"backup": backup}, "restore-1")
+        record = response["secret"]
+        self.assertEqual(2, record["version"])
+        self.assertEqual("separated", record["approval_mode"])
+        self.assertEqual(self.APPROVERS, record["approvers"])
+        self.assertEqual(["alice", "bob", "carol"], record["holders"])
+        # The rotation's invalidation marks survived the round trip.
+        rows = restored.store.connection.execute(
+            "SELECT version, invalidated_at FROM shares WHERE secret_id = 'prod-db-root'"
+        ).fetchall()
+        self.assertTrue(all(row["invalidated_at"] is not None for row in rows if row["version"] == 1))
+        self.assertTrue(all(row["invalidated_at"] is None for row in rows if row["version"] == 2))
+        # Approvals are still taken from the separated roster, not the holders.
+        self.assert_code(
+            "validation_error", restored.record_approval, "prod-db-root", {"approver": "alice"}, "a1"
+        )
+        restored.record_approval("prod-db-root", {"approver": "nina"}, "a2")
+
+    def test_restore_reads_v1_and_v2_backups_as_legacy(self):
+        self.create(policy=self.RECONSTRUCT_ONLY)
+        backup = self.service.export_backup("prod-db-root")
+
+        restored_v1 = self.second_service()
+        response = restored_v1.restore_backup({"backup": self.downgrade(backup, 1)}, "restore-1")
+        self.assertEqual("legacy", response["secret"]["approval_mode"])
+        self.assertEqual(HOLDERS, response["secret"]["approvers"])
+        self.assertIsNone(restored_v1.get_policy("prod-db-root")["policy"])
+
+        restored_v2 = self.second_service()
+        response = restored_v2.restore_backup({"backup": self.downgrade(backup, 2)}, "restore-1")
+        self.assertEqual("legacy", response["secret"]["approval_mode"])
+        self.assertEqual(self.RECONSTRUCT_ONLY, restored_v2.get_policy("prod-db-root")["policy"])
+
+    def test_restore_of_a_frozen_secret_keeps_the_freeze_rules(self):
+        self.create()
+        self.freeze()
+        backup = self.service.export_backup("prod-db-root")
+
+        restored = self.second_service()
+        response = restored.restore_backup({"backup": backup}, "restore-1")
+        self.assertEqual("frozen", response["secret"]["status"])
+        self.assertEqual("security incident under investigation", response["secret"]["status_reason"])
+        self.assert_code(
+            "secret_frozen", restored.distribute_share, "prod-db-root", {"holder": "alice"}, "share-alice"
+        )
+
+    def test_restore_validation(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        restored = self.second_service()
+        self.assert_code("validation_error", restored.restore_backup, {"backup": backup, "extra": 1}, "k1")
+        self.assert_code("validation_error", restored.restore_backup, {}, "k2")
+        self.assert_code("validation_error", restored.restore_backup, {"backup": backup}, None)
+        unsupported = copy.deepcopy(backup)
+        unsupported["backup_version"] = "thresholdsafe-backup-v9"
+        self.assert_code("validation_error", restored.restore_backup, {"backup": unsupported}, "k3")
+        self.assert_code("not_found", restored.get_secret, "prod-db-root")
+
+    def test_restore_rejects_tampered_backups_without_side_effects(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        restored = self.second_service()
+        broken = copy.deepcopy(backup)
+        broken["secret"]["name"] = "Forged name"
+        self.assert_code("backup_integrity", restored.restore_backup, {"backup": broken}, "restore-1")
+        broken = copy.deepcopy(backup)
+        broken["audit_events"][0]["payload"]["name"] = "Forged name"
+        broken["checksum"] = stamp({k: v for k, v in broken.items() if k != "checksum"})["checksum"]
+        self.assert_code("backup_integrity", restored.restore_backup, {"backup": broken}, "restore-2")
+        # Nothing was imported: no secret, no events, no idempotency records.
+        self.assert_code("not_found", restored.get_secret, "prod-db-root")
+        row = restored.store.connection.execute("SELECT COUNT(*) AS n FROM idempotency").fetchone()
+        self.assertEqual(0, row["n"])
+
+    def test_restore_rejects_an_existing_secret_without_side_effects(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        restored = self.second_service()
+        restored.create_secret(create_body(), "create-1")
+        self.assert_code("conflict", restored.restore_backup, {"backup": backup}, "restore-1")
+        types = [event["type"] for event in restored.audit("prod-db-root")["events"]]
+        self.assertNotIn("backup_restored", types)
+        row = restored.store.connection.execute(
+            "SELECT COUNT(*) AS n FROM idempotency WHERE key = 'restore-1'"
+        ).fetchone()
+        self.assertEqual(0, row["n"])
+
+    def test_restore_is_idempotent_and_conflict_scoped(self):
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        restored = self.second_service()
+        first = restored.restore_backup({"backup": backup}, "restore-1")
+        self.assertEqual(first, restored.restore_backup({"backup": backup}, "restore-1"))
+        events = [
+            event for event in restored.audit("prod-db-root")["events"]
+            if event["type"] == "backup_restored"
+        ]
+        self.assertEqual(1, len(events))
+        # A different backup reusing the same key is a conflict.
+        self.service.create_secret(create_body(id="other-secret"), "create-2")
+        other = self.service.export_backup("other-secret")
+        self.assert_code("conflict", restored.restore_backup, {"backup": other}, "restore-1")
+        self.assert_code("not_found", restored.get_secret, "other-secret")
+
+    def test_restore_keeps_the_target_receipt_key(self):
+        self.create()
+        self.issue()
+        source_key = self.service.receipt_key()
+        backup = self.service.export_backup("prod-db-root")
+
+        restored = self.second_service()
+        target_key = restored.receipt_key()
+        self.assertNotEqual(source_key["public_key"], target_key["public_key"])
+        restored.restore_backup({"backup": backup}, "restore-1")
+        self.assertEqual(target_key, restored.receipt_key())
+        # Receipts issued after the restore are signed by the target key.
+        receipt = restored.issue_receipt("prod-db-root", {"sequence": 1, "nonce": "n"}, "receipt-1")
+        self.assertEqual(target_key["key_id"], receipt["key_id"])
+        self.assertEqual(
+            {"valid": True},
+            restored.verify_receipt({"receipt": receipt, "public_key": target_key["public_key"]}),
+        )
+
+    def test_concurrent_restore_allows_a_single_success(self):
+        import threading
+
+        self.create()
+        backup = self.service.export_backup("prod-db-root")
+        restored = self.second_service()
+        results: list[dict] = []
+        errors: list[Exception] = []
+
+        def restore_one(index: int) -> None:
+            try:
+                results.append(restored.restore_backup({"backup": backup}, f"restore-{index}"))
+            except Exception as error:  # pragma: no cover - surfaced below
+                errors.append(error)
+
+        threads = [threading.Thread(target=restore_one, args=(index,)) for index in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(1, len(results))
+        self.assertEqual(7, len(errors))
+        for error in errors:
+            self.assertIsInstance(error, ThresholdSafeError)
+            self.assertEqual("conflict", error.code)
+        run = restored.audit("prod-db-root")
+        self.assertTrue(run["chain_valid"])
+        restored_events = [e for e in run["events"] if e["type"] == "backup_restored"]
+        self.assertEqual(1, len(restored_events))
 
 
 

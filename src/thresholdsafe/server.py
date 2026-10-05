@@ -46,6 +46,8 @@ class Handler(BaseHTTPRequestHandler):
             return 200, self.service.get_secret(parts[1])
         if self.command == "POST" and parts == ["backups", "verify"]:
             return 200, self.service.verify_backup(self._body())
+        if self.command == "POST" and parts == ["backups", "restore"]:
+            return 201, self.service.restore_backup(self._body(), key)
         if self.command == "GET" and parts == ["audit", "receipt-key"]:
             return 200, self.service.receipt_key()
         if self.command == "POST" and parts == ["audit", "receipts", "verify"]:
